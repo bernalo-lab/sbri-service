@@ -1,3 +1,6 @@
+// index.js — SBRI service v1.2 (Latest Accounts fix + Status injector)
+// Baseline: index_v1.1.js
+
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -12,7 +15,10 @@ const client = new MongoClient(process.env.MONGO_URI);
 await client.connect();
 const db = client.db();
 
-//
+/**
+ * Injects business status from sbri_business_profiles into an existing profile object
+ * (kept from v1.1)
+ */
 async function injectBusinessStatus(db, companyNumber, profileObj) {
   try {
     const doc = await db.collection('sbri_business_profiles')
@@ -25,13 +31,32 @@ async function injectBusinessStatus(db, companyNumber, profileObj) {
   return profileObj;
 }
 
+/**
+ * Loads the most recent accounts document for a company from the first
+ * available collection. We keep names broad in case your data sits in a
+ * slightly different collection in other environments.
+ */
+async function loadLatestAccounts(db, companyNumber) {
+  const candidates = [
+    'financial_accounts',
+    'sbri_financial_accounts',
+    'company_accounts',
+    'accounts'
+  ];
+  for (const coll of candidates) {
+    try {
+      const arr = await db.collection(coll)
+        .find({ company_number: companyNumber })
+        .sort({ period_end: -1, periodEnd: -1, year: -1 })
+        .limit(1)
+        .toArray();
+      if (arr && arr[0]) return arr[0];
+    } catch (_) { /* collection may not exist; skip */ }
+  }
+  return null;
+}
 
-
-
-
-
-
-//
+// ----------------- Endpoints -----------------
 
 app.get('/api/sbri/health', async (req, res) => {
   const profilesCount = await db.collection('profiles').countDocuments();
@@ -49,14 +74,23 @@ app.get('/api/sbri/search', async (req, res) => {
   res.json(items);
 });
 
-// Optional: fetch one company by number
+// Single company profile — now includes `latest_accounts` on the profile object
 app.get('/api/sbri/company/:number', async (req, res) => {
   try {
     const n = String(req.params.number);
     const base = await db.collection('profiles').findOne({ company_number: n }) || {};
     const withStatus = await injectBusinessStatus(db, n, base);
+
+    // NEW in v1.2: attach latest_accounts so the UI can read it directly
+    if (!withStatus.latest_accounts) {
+      const latest = await loadLatestAccounts(db, n);
+      if (latest) withStatus.latest_accounts = latest;
+    }
+
     res.json(withStatus);
-  } catch (e) { res.status(500).json({ error: 'profile_lookup_failed' }); }
+  } catch (e) {
+    res.status(500).json({ error: 'profile_lookup_failed' });
+  }
 });
 
 // ----- Filings (paged) -----
@@ -90,16 +124,19 @@ app.get('/api/sbri/insolvency/:number', async (req, res) => {
   res.json({ items });
 });
 
-// ----- "Full" company view used by the UI (profile + latest accounts quick look) -----
+// ----- "Full" company view used by the UI (unchanged shape; uses same loader) -----
 app.get('/api/sbri/company/:number/full', async (req, res) => {
   try {
     const n = String(req.params.number);
     const base = await db.collection('profiles').findOne({ company_number: n }) || {};
     const profile = await injectBusinessStatus(db, n, base);
-    const latest = await db.collection('financial_accounts')
-      .find({ company_number: n }).sort({ period_end: -1 }).limit(1).toArray();
-    res.json({ company_number: n, profile, latest_accounts: latest[0] || null });
-  } catch (e) { res.status(500).json({ error: 'profile_full_failed' }); }
+
+    const latest = await loadLatestAccounts(db, n);
+
+    res.json({ company_number: n, profile, latest_accounts: latest || null });
+  } catch (e) {
+    res.status(500).json({ error: 'profile_full_failed' });
+  }
 });
 
 app.listen(process.env.PORT || 3000, () => {
