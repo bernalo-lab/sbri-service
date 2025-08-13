@@ -1,5 +1,5 @@
-// index.js — SBRI service v1.2 (Latest Accounts fix + Status injector)
-// Baseline: index_v1.1.js
+// index.js — SBRI service v1.3 (Scoring)
+// Baseline: index_v1.2.js
 
 import express from 'express';
 import cors from 'cors';
@@ -56,8 +56,28 @@ async function loadLatestAccounts(db, companyNumber) {
   return null;
 }
 
-// ----------------- Endpoints -----------------
+async function loadRiskDoc(db, companyNumber) {
+  const collections = ['sbri_risk_scores', 'risk_scores', 'scores'];
+  for (const coll of collections) {
+    try {
+      const arr = await db.collection(coll)
+        .find({ company_number: companyNumber })
+        .sort({ updated_at: -1 })
+        .limit(1)
+        .toArray();
+      if (arr[0]) return arr[0];
+    } catch {}
+  }
+  return null;
+}
 
+function riskBand(score) {
+  if (score >= 70) return 'high';
+  if (score >= 40) return 'medium';
+  return 'low';
+}
+
+// ----------------- Endpoints -----------------
 app.get('/api/sbri/health', async (req, res) => {
   const profilesCount = await db.collection('profiles').countDocuments();
   res.json({ status: 'ok', profiles: profilesCount });
@@ -136,6 +156,64 @@ app.get('/api/sbri/company/:number/full', async (req, res) => {
     res.json({ company_number: n, profile, latest_accounts: latest || null });
   } catch (e) {
     res.status(500).json({ error: 'profile_full_failed' });
+  }
+});
+
+// GET /api/sbri/company/:number/scored
+app.get('/api/sbri/company/:number/scored', async (req, res) => {
+  try {
+    const n = String(req.params.number);
+
+    // Base profile (re-use your existing logic & inject status + latest accounts)
+    const base = await db.collection('profiles').findOne({ company_number: n }) || {};
+    const profile = await injectBusinessStatus(db, n, base);
+    if (!profile.latest_accounts) {
+      const latest = await loadLatestAccounts(db, n);
+      if (latest) profile.latest_accounts = latest;
+    }
+
+    // 1) Try explicit risk score from DB
+    const found = await loadRiskDoc(db, n);
+    if (found) {
+      const score = Number(found.score);
+      const reasons = Array.isArray(found.reasons) ? found.reasons : [];
+      return res.json({ profile, risk: { score, level: riskBand(score), reasons } });
+    }
+
+    // 2) Optional computed fallback (enable via ?compute=1)
+    if ((req.query.compute || '0') === '1') {
+      const t = Number(profile.latest_accounts?.turnover) || 0;
+      const p = Number(profile.latest_accounts?.profit) || 0;
+      const margin = t > 0 ? p / t : 0;                           // 0.096 == 9.6% in your screenshot
+      const sic = (profile.sic_codes || [])[0];
+
+      let sector = null;
+      try {
+        sector = await db.collection('sector_stats').findOne({ sic_code: sic, region: profile.region })
+              || await db.collection('sector_stats').findOne({ sic_code: sic });
+      } catch {}
+
+      const rawFail = sector?.failure_rate ?? 0;                  // may be 0.018 or 1.8
+      const failRate = rawFail > 1 ? rawFail / 100 : rawFail;     // normalise to 0..1
+
+      // Simple heuristic score (0=best, 100=worst)
+      const marginPenalty = margin >= 0.15 ? 0 : (margin <= 0 ? 1 : (0.15 - margin) / 0.15);
+      const failurePenalty = Math.max(0, Math.min(1, failRate));
+      const score = Math.max(0, Math.min(100, 100 * (0.65 * marginPenalty + 0.35 * failurePenalty)));
+
+      const reasons = [
+        `Gross margin ~ ${(margin * 100).toFixed(1)}%`,
+        `Sector failure ~ ${(failurePenalty * 100).toFixed(1)}%`,
+        score >= 70 ? 'High risk band' : score >= 40 ? 'Medium risk band' : 'Low risk band'
+      ];
+
+      return res.json({ profile, risk: { score: Math.round(score), level: riskBand(score), reasons } });
+    }
+
+    // 3) No score available
+    res.json({ profile, risk: null });
+  } catch (e) {
+    res.status(500).json({ error: 'profile_scored_failed' });
   }
 });
 
