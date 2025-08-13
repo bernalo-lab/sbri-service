@@ -159,12 +159,12 @@ app.get('/api/sbri/company/:number/full', async (req, res) => {
   }
 });
 
-// GET /api/sbri/company/:number/scored
+// GET /api/sbri/company/:number/scored  (v1.3: compute fallback by default)
 app.get('/api/sbri/company/:number/scored', async (req, res) => {
   try {
     const n = String(req.params.number);
 
-    // Base profile (re-use your existing logic & inject status + latest accounts)
+    // Base profile (reuse existing logic)
     const base = await db.collection('profiles').findOne({ company_number: n }) || {};
     const profile = await injectBusinessStatus(db, n, base);
     if (!profile.latest_accounts) {
@@ -173,45 +173,52 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
     }
 
     // 1) Try explicit risk score from DB
-    const found = await loadRiskDoc(db, n);
-    if (found) {
-      const score = Number(found.score);
-      const reasons = Array.isArray(found.reasons) ? found.reasons : [];
-      return res.json({ profile, risk: { score, level: riskBand(score), reasons } });
+    let stored = null;
+    try {
+      const arr = await db.collection('sbri_risk_scores')
+        .find({ company_number: n })
+        .sort({ updated_at: -1 })
+        .limit(1)
+        .toArray();
+      stored = arr[0] || null;
+    } catch {}
+
+    if (stored) {
+      const score = Number(stored.score);
+      const reasons = Array.isArray(stored.reasons) ? stored.reasons : [];
+      return res.json({ profile, risk: { score, level: score >= 70 ? 'high' : score >= 40 ? 'medium' : 'low', reasons } });
     }
 
-    // 2) Optional computed fallback (enable via ?compute=1)
-    if ((req.query.compute || '0') === '1') {
-      const t = Number(profile.latest_accounts?.turnover) || 0;
-      const p = Number(profile.latest_accounts?.profit) || 0;
-      const margin = t > 0 ? p / t : 0;                           // 0.096 == 9.6% in your screenshot
-      const sic = (profile.sic_codes || [])[0];
+    // 2) Fallback: compute score automatically (NO query param needed)
+    const t = Number(profile.latest_accounts?.turnover) || 0;
+    const p = Number(profile.latest_accounts?.profit) || 0;
+    const margin = t > 0 ? p / t : 0;
 
-      let sector = null;
-      try {
-        sector = await db.collection('sector_stats').findOne({ sic_code: sic, region: profile.region })
-              || await db.collection('sector_stats').findOne({ sic_code: sic });
-      } catch {}
+    const sic = (profile.sic_codes || [])[0];
+    let sector = null;
+    try {
+      sector = await db.collection('sector_stats')
+        .findOne({ sic_code: sic, region: profile.region }) ||
+               await db.collection('sector_stats').findOne({ sic_code: sic });
+    } catch {}
 
-      const rawFail = sector?.failure_rate ?? 0;                  // may be 0.018 or 1.8
-      const failRate = rawFail > 1 ? rawFail / 100 : rawFail;     // normalise to 0..1
+    const rawFail = sector?.failure_rate ?? 0;         // could be 0.018 or 1.8
+    const failRate = rawFail > 1 ? rawFail / 100 : rawFail;
 
-      // Simple heuristic score (0=best, 100=worst)
-      const marginPenalty = margin >= 0.15 ? 0 : (margin <= 0 ? 1 : (0.15 - margin) / 0.15);
-      const failurePenalty = Math.max(0, Math.min(1, failRate));
-      const score = Math.max(0, Math.min(100, 100 * (0.65 * marginPenalty + 0.35 * failurePenalty)));
+    // Heuristic score (0 best → 100 worst)
+    const marginPenalty = margin >= 0.15 ? 0 : (margin <= 0 ? 1 : (0.15 - margin) / 0.15);
+    const failurePenalty = Math.max(0, Math.min(1, failRate));
+    const scoreFloat = 100 * (0.65 * marginPenalty + 0.35 * failurePenalty);
+    const score = Math.max(0, Math.min(100, Math.round(scoreFloat)));
+    const level = score >= 70 ? 'high' : score >= 40 ? 'medium' : 'low';
 
-      const reasons = [
-        `Gross margin ~ ${(margin * 100).toFixed(1)}%`,
-        `Sector failure ~ ${(failurePenalty * 100).toFixed(1)}%`,
-        score >= 70 ? 'High risk band' : score >= 40 ? 'Medium risk band' : 'Low risk band'
-      ];
+    const reasons = [
+      `Gross margin ~ ${(margin * 100).toFixed(1)}%`,
+      `Sector failure ~ ${(failurePenalty * 100).toFixed(1)}%`,
+      level === 'high' ? 'High risk band' : level === 'medium' ? 'Medium risk band' : 'Low risk band'
+    ];
 
-      return res.json({ profile, risk: { score: Math.round(score), level: riskBand(score), reasons } });
-    }
-
-    // 3) No score available
-    res.json({ profile, risk: null });
+    return res.json({ profile, risk: { score, level, reasons } });
   } catch (e) {
     res.status(500).json({ error: 'profile_scored_failed' });
   }
