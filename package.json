@@ -4,12 +4,17 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
-    "seed": "node scripts/seed-sbri.js"
+    "seed": "node scripts/seed-sbri.js",
+    "seed:extended": "node scripts/seed-extended.mjs",
+    "seed:directors": "node scripts/seed-director-changes.js",
+    "seed:company": "node scripts/seed-company.js",
+    "seed:company:clean": "node scripts/seed-company.js --clean-only"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "dotenv": "^16.3.1",
+    "dotenv": "^16.6.1",
     "express": "^4.18.2",
-    "mongodb": "^6.3.0"
+    "mongodb": "^6.3.0",
+    "mongoose": "^8.17.1"
   }
 }
