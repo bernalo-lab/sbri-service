@@ -24,13 +24,6 @@ import { MongoClient } from 'mongodb';
 import { spawnSync } from 'child_process';
 import yargs from 'yargs/yargs';
 import { hideBin } from 'yargs/helpers';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-// Workaround to get __dirname in ES modules
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
 
 const argv = yargs(hideBin(process.argv))
   .usage('Usage: $0 <companyNo> [--reseed|--clean|--variant=a]')
