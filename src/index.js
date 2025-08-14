@@ -1,5 +1,5 @@
-// index.js — SBRI service v1.6
-// Adds date range filtering + summary for director changes
+// index.js — SBRI service v1.6.2
+// Baseline preserved. Adds CCJ endpoint: GET /api/sbri/company/:number/ccj
 
 import express from 'express';
 import cors from 'cors';
@@ -43,16 +43,14 @@ async function loadLatestAccounts(db, companyNumber) {
   return null;
 }
 
-/* --- Director changes with date range + summary --- */
+/* --- Director changes with date range + summary (baseline) --- */
 function coalesceDateStage() {
-  // Builds the $set stage that computes event_date from many possible fields
   const fields = [
     'effective_date','event_date','change_date','date',
     'appointed_on','appointment_date',
     'resigned_on','resignation_date',
     'notified_on','updated_at','created_at'
   ];
-  // $ifNull chain
   const eventDateExpr = fields.reduceRight((acc, f) => ({ $ifNull: [ `$${f}`, acc ] }), null);
   return {
     $set: {
@@ -73,7 +71,6 @@ function coalesceDateStage() {
     }
   };
 }
-
 function dateRangeMatchStage(from, to) {
   if (!from && !to) return null;
   const cond = {};
@@ -81,17 +78,11 @@ function dateRangeMatchStage(from, to) {
   if (to) cond.$lte = to;
   return { $match: { event_date: cond } };
 }
-
 function parseDateParam(v) {
   if (!v) return null;
   const d = new Date(v);
   return isNaN(d.getTime()) ? null : d;
 }
-
-/**
- * Reads normalized director changes from the first available collection,
- * applying date range, pagination, and returning a summary.
- */
 async function loadDirectorChanges(db, companyNumber, { page = 1, size = 25, from, to } = {}) {
   const collections = [
     'officer_changes',
@@ -107,12 +98,10 @@ async function loadDirectorChanges(db, companyNumber, { page = 1, size = 25, fro
 
   for (const coll of collections) {
     try {
-      // Common “prep” stages
       const pre = [{ $match: { company_number: String(companyNumber) } }, coalesceDateStage()];
       const range = dateRangeMatchStage(fromD, toD);
       if (range) pre.push(range);
 
-      // 1) Paged items
       const listPipeline = [
         ...pre,
         { $sort: { event_date: -1 } },
@@ -121,12 +110,8 @@ async function loadDirectorChanges(db, companyNumber, { page = 1, size = 25, fro
         { $addFields: { raw: '$$ROOT' } }
       ];
       const arr = await db.collection(coll).aggregate(listPipeline).toArray();
-      if (!arr || arr.length === 0) {
-        // Try next collection if no docs matched (even after range)
-        continue;
-      }
+      if (!arr || arr.length === 0) continue;
 
-      // 2) Summary (over full range, not paged)
       const summaryPipeline = [
         ...pre,
         {
@@ -180,13 +165,11 @@ async function loadDirectorChanges(db, companyNumber, { page = 1, size = 25, fro
       const s = sumDoc[0] || { total: 0, appointments: 0, resignations: 0 };
       s.other = Math.max(0, (s.total || 0) - (s.appointments || 0) - (s.resignations || 0));
 
-      // Normalize the list
       const normalized = arr.map(doc => {
         const r = doc.raw || doc;
         const date = doc.event_date || r.effective_date || r.event_date || r.change_date || r.date ||
                      r.appointed_on || r.appointment_date || r.resigned_on || r.resignation_date ||
                      r.notified_on || r.updated_at || r.created_at || null;
-
         const explicitType = r.change_type || r.type || r.action || null;
         let inferred = explicitType ? String(explicitType) : '';
         const blob = (doc.type_text || '').toLowerCase();
@@ -194,13 +177,10 @@ async function loadDirectorChanges(db, companyNumber, { page = 1, size = 25, fro
           if (/resign/.test(blob)) inferred = 'Resigned';
           else if (/appoint/.test(blob)) inferred = 'Appointed';
         }
-
         const name =
           r.officer_name || r.name || r.person_name ||
           (r.officer && (r.officer.name || r.officer.person_name)) || null;
-
         const role = r.role || r.officer_role || r.position || null;
-
         const details =
           r.details || r.description || r.text ||
           (r.officer && (r.officer.details || r.officer.description)) || null;
@@ -214,20 +194,17 @@ async function loadDirectorChanges(db, companyNumber, { page = 1, size = 25, fro
         };
       });
 
-      // Count for pagination (not strictly required for UI, but handy)
       const countPipeline = [...pre, { $count: 'n' }];
       const countDoc = await db.collection(coll).aggregate(countPipeline).toArray();
       const totalDocs = countDoc[0]?.n || normalized.length;
 
       return { items: normalized, total: totalDocs, summary: s };
-    } catch (_) {
-      // try next collection
-    }
+    } catch (_) {}
   }
   return { items: [], total: 0, summary: { total: 0, appointments: 0, resignations: 0, other: 0 } };
 }
 
-/* --- endpoints (unchanged ones omitted for brevity) --- */
+/* --- endpoints (baseline preserved) --- */
 app.get('/api/sbri/health', async (_req, res) => {
   const profilesCount = await db.collection('profiles').countDocuments();
   res.json({ status: 'ok', profiles: profilesCount });
@@ -270,8 +247,7 @@ app.get('/api/sbri/company/:number/filings', async (req, res) => {
   res.json({ page, size, items });
 });
 
-// UPDATED: Director changes with date range + summary
-// GET /api/sbri/company/:number/director-changes?page=&size=&from=YYYY-MM-DD&to=YYYY-MM-DD
+// Director changes (baseline + range)
 app.get('/api/sbri/company/:number/director-changes', async (req, res) => {
   try {
     const page = Math.max(1, Number(req.query.page || 1));
@@ -365,6 +341,53 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
   }
 });
 
+/* --- NEW: CCJ endpoint (paged list + summary) --- */
+// Collection: sbri_ccj_details
+// Doc shape (suggested):
+// { company_number, judgment_date: Date, amount: Number, court, case_number, status: 'open'|'unsatisfied'|'satisfied', satisfied_date: Date|null, source }
+app.get('/api/sbri/company/:number/ccj', async (req, res) => {
+  try {
+    const n = String(req.params.number);
+    const page = Math.max(1, Number(req.query.page || 1));
+    const size = Math.min(100, Number(req.query.size || 25));
+
+    const col = db.collection('sbri_ccj_details');
+
+    const items = await col.find({ company_number: n })
+      .sort({ judgment_date: -1 })
+      .skip((page - 1) * size)
+      .limit(size)
+      .toArray();
+
+    const summaryAgg = await col.aggregate([
+      { $match: { company_number: n } },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: 1 },
+          total_amount: { $sum: { $ifNull: ['$amount', 0] } },
+          unsatisfied: {
+            $sum: {
+              $cond: [
+                { $in: [{ $toLower: { $ifNull: ['$status', ''] } }, ['open','unsatisfied','outstanding']] },
+                1, 0
+              ]
+            }
+          },
+          latest_judgment_date: { $max: '$judgment_date' }
+        }
+      },
+      { $project: { _id: 0 } }
+    ]).toArray();
+
+    const summary = summaryAgg[0] || { total: 0, total_amount: 0, unsatisfied: 0, latest_judgment_date: null };
+
+    res.json({ page, size, summary, items });
+  } catch (e) {
+    res.status(500).json({ error: 'ccj_fetch_failed' });
+  }
+});
+
 app.listen(process.env.PORT || 3000, () => {
-  console.log(`SBRI service running on port ${process.env.PORT || 3000}`);
+  console.log(`SBRI service running on port ${process.env.PORT || 3000} (v1.6.2)`);
 });
