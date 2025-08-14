@@ -12,11 +12,17 @@
  *   MONGO_URI=mongodb+srv://user:pass@cluster/dbname
  */
 
-const { MongoClient } = require('mongodb');
-const { spawnSync } = require('child_process');
-const yargs = require('yargs/yargs');
-const { hideBin } = require('yargs/helpers');
-const path = require('path');
+import { MongoClient } from 'mongodb';
+import { spawnSync } from 'child_process';
+import yargs from 'yargs/yargs';
+import { hideBin } from 'yargs/helpers';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+// Workaround to get __dirname in ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 
 const argv = yargs(hideBin(process.argv))
   .usage('Usage: $0 <companyNo> [--reseed|--clean|--variant=a]')
