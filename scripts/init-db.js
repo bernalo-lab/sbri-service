@@ -1,4 +1,5 @@
 /* scripts/init-db.js
+ * Version: 1.1
  * One-shot DB init for SBRI:
  * - Creates indexes
  * - (optional) cleans existing records for a company
@@ -11,6 +12,13 @@
  * Env:
  *   MONGO_URI=mongodb+srv://user:pass@cluster/dbname
  */
+import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.join(__dirname, '..', '.env') }); // adjust path if needed
+
 
 import { MongoClient } from 'mongodb';
 import { spawnSync } from 'child_process';
