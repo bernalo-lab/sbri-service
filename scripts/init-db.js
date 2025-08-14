@@ -61,5 +61,11 @@ const INDEXES = [
 
 const ALL_COLLECTIONS_FOR_CLEAN = INDEXES.map(x => x.col);
 
-const indexNameFromSpec = (spec) =>
-  Object.entries(spec).map(([k, v])
+// before (problematic on your machine):
+// const indexNameFromSpec = (spec) =>
+//   Object.entries(spec).map(([k, v]) => `${k}_${v}`).join('_');
+
+// after (no destructuring):
+const indexNameFromSpec = (spec) => {
+  return Object.keys(spec).map((k) => `${k}_${spec[k]}`).join('_');
+};
