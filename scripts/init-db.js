@@ -1,7 +1,7 @@
 /* scripts/init-db.js
- * Version: 1.1
+ * Version: 1.3
  * One-shot DB init for SBRI:
- * - Creates indexes
+ * - Ensures indexes (with correct uniqueness per collection)
  * - (optional) cleans existing records for a company
  * - Runs ALL seeders for that company
  *
@@ -12,13 +12,14 @@
  * Env:
  *   MONGO_URI=mongodb+srv://user:pass@cluster/dbname
  */
+
 import dotenv from 'dotenv';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.join(__dirname, '..', '.env') }); // adjust path if needed
-
 
 import { MongoClient } from 'mongodb';
 import { spawnSync } from 'child_process';
@@ -40,89 +41,25 @@ if (!process.env.MONGO_URI) {
   process.exit(1);
 }
 
+/** Desired indexes per collection (set unique where it should be one row per company). */
 const INDEXES = [
-  ['profiles', { company_number: 1 }],
-  ['sbri_business_profiles', { company_number: 1 }],
-  ['sbri_accounts', { company_number: 1 }],
-  ['sbri_directors', { company_number: 1 }],
-  ['sbri_director_changes', { company_number: 1 }],
-  ['sbri_sector_benchmark', { company_number: 1 }],
-  ['sbri_ccj_details', { company_number: 1 }],
-  // include if you persist scores
-  ['sbri_scores', { company_number: 1 }],
+  // one row per company
+  { col: 'profiles',               spec: { company_number: 1 }, opts: { name: 'company_number_1', unique: true } },
+  { col: 'sbri_business_profiles', spec: { company_number: 1 }, opts: { name: 'company_number_1', unique: true } },
+
+  // many rows per company
+  { col: 'sbri_accounts',          spec: { company_number: 1 }, opts: { name: 'company_number_1' } },
+  { col: 'sbri_directors',         spec: { company_number: 1 }, opts: { name: 'company_number_1' } },
+  { col: 'sbri_director_changes',  spec: { company_number: 1 }, opts: { name: 'company_number_1' } },
+  { col: 'sbri_sector_benchmark',  spec: { company_number: 1 }, opts: { name: 'company_number_1' } },
+  { col: 'sbri_ccj_details',       spec: { company_number: 1 }, opts: { name: 'company_number_1' } },
+
+  // change to unique:true if you store one score per company
+  // If you store snapshots you may want non-unique; if single row per company, set unique: true
+  { col: 'sbri_scores',            spec: { company_number: 1 }, opts: { name: 'company_number_1' } },
 ];
 
-const ALL_COLLECTIONS_FOR_CLEAN = INDEXES.map(([name]) => name);
+const ALL_COLLECTIONS_FOR_CLEAN = INDEXES.map(x => x.col);
 
-async function createIndexes(db) {
-  for (const [col, spec] of INDEXES) {
-    await db.collection(col).createIndex(spec);
-    console.log(`✓ index ensured on ${col} ${JSON.stringify(spec)}`);
-  }
-}
-
-async function cleanCompanyEverywhere(db, companyNo) {
-  console.log(`Cleaning existing data for ${companyNo} across all SBRI collections…`);
-  for (const col of ALL_COLLECTIONS_FOR_CLEAN) {
-    const res = await db.collection(col).deleteMany({ company_number: companyNo });
-    console.log(`- ${col}: removed ${res.deletedCount}`);
-  }
-  console.log('✓ Cleaned');
-}
-
-function runSeeder(script, args = []) {
-  const scriptPath = path.join(__dirname, script);
-  const cmdArgs = [scriptPath, ...args];
-  const res = spawnSync(process.execPath, cmdArgs, { stdio: 'inherit' }); // node <script> ...
-  if (res.status !== 0) {
-    console.error(`Seeder failed: ${script} ${args.join(' ')}`);
-    process.exit(res.status || 1);
-  }
-}
-
-async function main() {
-  const client = new MongoClient(process.env.MONGO_URI);
-  await client.connect();
-  const db = client.db(); // use DB from URI
-
-  try {
-    // 1) Indexes
-    console.log('Ensuring indexes…');
-    await createIndexes(db);
-
-    // 2) Clean if requested
-    if (argv.clean || argv.reseed) {
-      await cleanCompanyEverywhere(db, companyNo);
-    }
-
-    // 3) Seed base -> then fill everything else
-    console.log(`\nSeeding ALL data for ${companyNo} (variant ${argv.variant})…\n`);
-
-    // base company shell
-    runSeeder('./seed-company.js', [companyNo, `--variant=${argv.variant}`]);
-
-    // in parallel-friendly order, but we’ll keep sequential for clarity/reliability
-    runSeeder('./seed-accounts.js', [companyNo]);
-    runSeeder('./seed-sic-region.js', [companyNo]);
-    runSeeder('./seed-directors.js', [companyNo]);
-    runSeeder('./seed-director-changes.js', [companyNo]);
-    runSeeder('./seed-sector-benchmark.js', [companyNo]);
-    runSeeder('./seed-ccj-details.js', [companyNo]);
-
-    // optional cached score
-    try {
-      runSeeder('./seed-scores.js', [companyNo]);
-    } catch {
-      // ignore if you don't have this script
-    }
-
-    console.log('\n✓ Done. All collections populated.');
-  } finally {
-    await client.close();
-  }
-}
-
-main().catch(err => {
-  console.error(err);
-  process.exit(1);
-});
+const indexNameFromSpec = (spec) =>
+  Object.entries(spec).map(([k, v])
