@@ -1,7 +1,10 @@
-// scripts/seed-company.js
-require('dotenv').config();
-const mongoose = require('mongoose');
-const DirectorChange = require('../models/DirectorChange');
+// scripts/seed-company.js (ESM header)
+import 'dotenv/config';
+import mongoose from 'mongoose';
+import DirectorChange from '../models/DirectorChange.js';
+
+// ...rest of the file unchanged...
+
 
 const MONGO_URI = process.env.MONGO_URI;
 
