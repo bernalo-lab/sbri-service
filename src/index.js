@@ -1,5 +1,5 @@
-// index.js — SBRI service v1.3 (Scoring)
-// Baseline: index_v1.2.js
+// index.js v1.5 - Director changes
+// Baseline: index_v1.3.js
 
 import express from 'express';
 import cors from 'cors';
@@ -32,9 +32,7 @@ async function injectBusinessStatus(db, companyNumber, profileObj) {
 }
 
 /**
- * Loads the most recent accounts document for a company from the first
- * available collection. We keep names broad in case your data sits in a
- * slightly different collection in other environments.
+ * Loads the most recent accounts document for a company.
  */
 async function loadLatestAccounts(db, companyNumber) {
   const candidates = [
@@ -51,7 +49,7 @@ async function loadLatestAccounts(db, companyNumber) {
         .limit(1)
         .toArray();
       if (arr && arr[0]) return arr[0];
-    } catch (_) { /* collection may not exist; skip */ }
+    } catch (_) {}
   }
   return null;
 }
@@ -77,13 +75,121 @@ function riskBand(score) {
   return 'low';
 }
 
+// ----------------- New helper: Director changes loader -----------------
+/**
+ * Returns normalized director/officer change events for a company.
+ * Tries several collection names and field shapes, normalizes to:
+ * { date, type, name, role, details }
+ */
+async function loadDirectorChanges(db, companyNumber, { page = 1, size = 25 } = {}) {
+  const candidates = [
+    'officer_changes',
+    'director_changes',
+    'officers_changes',
+    'officer_appointments',
+    'appointments',
+    'officers', // sometimes holds appointment/resignation history
+  ];
+
+  // Build an aggregation that:
+  // 1) filters by company_number
+  // 2) projects a unified event_date picking first non-null among many fields
+  // 3) sorts by event_date desc
+  // 4) paginates
+  const dateCoalesce = (fields) => {
+    // Chains $ifNull for a list of fields
+    return fields.reduceRight((acc, f) => ({ $ifNull: [ `$${f}`, acc ] }), null);
+  };
+
+  const dateFields = [
+    'effective_date', 'event_date', 'change_date', 'date',
+    'appointed_on', 'appointment_date',
+    'resigned_on', 'resignation_date',
+    'notified_on', 'updated_at', 'created_at'
+  ];
+
+  for (const coll of candidates) {
+    try {
+      const pipeline = [
+        { $match: { company_number: String(companyNumber) } },
+        {
+          $project: {
+            raw: '$$ROOT',
+            event_date: dateCoalesce(dateFields),
+            // pass-throughs for normalization
+            change_type: 1,
+            action: 1,
+            type: 1,
+            officer_name: 1,
+            name: 1,
+            person_name: 1,
+            officer: 1,
+            role: 1,
+            officer_role: 1,
+            position: 1,
+            details: 1,
+            description: 1,
+            text: 1,
+          }
+        },
+        { $sort: { event_date: -1 } },
+        { $skip: Math.max(0, (page - 1) * size) },
+        { $limit: Math.min(100, size) }
+      ];
+
+      const arr = await db.collection(coll).aggregate(pipeline).toArray();
+      if (!arr || arr.length === 0) continue;
+
+      const normalized = arr.map(doc => {
+        const r = doc.raw || doc;
+        const date = doc.event_date || r.effective_date || r.event_date || r.change_date || r.date ||
+                     r.appointed_on || r.appointment_date || r.resigned_on || r.resignation_date ||
+                     r.notified_on || r.updated_at || r.created_at || null;
+
+        // Derive type where possible
+        const explicitType = r.change_type || r.type || r.action || null;
+        let inferred = explicitType ? String(explicitType) : '';
+        const str = JSON.stringify(r).toLowerCase();
+
+        if (!inferred) {
+          if (r.resigned_on || /resign/.test(str)) inferred = 'Resigned';
+          else if (r.appointed_on || /appoint/.test(str)) inferred = 'Appointed';
+        }
+
+        const name =
+          r.officer_name || r.name || r.person_name ||
+          (r.officer && (r.officer.name || r.officer.person_name)) || null;
+
+        const role = r.role || r.officer_role || r.position || null;
+
+        const details =
+          r.details || r.description || r.text ||
+          (r.officer && (r.officer.details || r.officer.description)) || null;
+
+        return {
+          date,
+          type: inferred ? String(inferred).replace(/\b\w/g, c => c.toUpperCase()) : null,
+          name,
+          role,
+          details
+        };
+      });
+
+      return normalized;
+    } catch (_) {
+      // collection might not exist or pipeline incompatible; try next
+    }
+  }
+  return [];
+}
+
 // ----------------- Endpoints -----------------
 app.get('/api/sbri/health', async (req, res) => {
   const profilesCount = await db.collection('profiles').countDocuments();
   res.json({ status: 'ok', profiles: profilesCount });
 });
 
-// Search by company name (uses the 'profiles' collection you seeded)
+// Search by company name
 app.get('/api/sbri/search', async (req, res) => {
   const name = String(req.query.name || '');
   if (!name) return res.json([]);
@@ -94,14 +200,13 @@ app.get('/api/sbri/search', async (req, res) => {
   res.json(items);
 });
 
-// Single company profile — now includes `latest_accounts` on the profile object
+// Single company profile
 app.get('/api/sbri/company/:number', async (req, res) => {
   try {
     const n = String(req.params.number);
     const base = await db.collection('profiles').findOne({ company_number: n }) || {};
     const withStatus = await injectBusinessStatus(db, n, base);
 
-    // NEW in v1.2: attach latest_accounts so the UI can read it directly
     if (!withStatus.latest_accounts) {
       const latest = await loadLatestAccounts(db, n);
       if (latest) withStatus.latest_accounts = latest;
@@ -113,7 +218,7 @@ app.get('/api/sbri/company/:number', async (req, res) => {
   }
 });
 
-// ----- Filings (paged) -----
+// Filings (paged)
 app.get('/api/sbri/company/:number/filings', async (req, res) => {
   const n = req.params.number;
   const page = Math.max(1, Number(req.query.page || 1));
@@ -127,14 +232,26 @@ app.get('/api/sbri/company/:number/filings', async (req, res) => {
   res.json({ page, size, items });
 });
 
-// ----- Sector benchmark by SIC -----
+// NEW: Director changes (paged)
+app.get('/api/sbri/company/:number/director-changes', async (req, res) => {
+  try {
+    const page = Math.max(1, Number(req.query.page || 1));
+    const size = Math.min(100, Number(req.query.size || 25));
+    const items = await loadDirectorChanges(db, String(req.params.number), { page, size });
+    res.json({ page, size, items });
+  } catch (e) {
+    res.status(500).json({ error: 'director_changes_failed' });
+  }
+});
+
+// Sector benchmark by SIC
 app.get('/api/sbri/sector/:sic', async (req, res) => {
   const doc = await db.collection('sector_stats')
     .findOne({ sic_code: req.params.sic });
   res.json(doc || {});
 });
 
-// ----- Insolvency notices for a company -----
+// Insolvency notices
 app.get('/api/sbri/insolvency/:number', async (req, res) => {
   const items = await db.collection('insolvency_notices')
     .find({ company_number: req.params.number })
@@ -144,7 +261,7 @@ app.get('/api/sbri/insolvency/:number', async (req, res) => {
   res.json({ items });
 });
 
-// ----- "Full" company view used by the UI (unchanged shape; uses same loader) -----
+// "Full" company view
 app.get('/api/sbri/company/:number/full', async (req, res) => {
   try {
     const n = String(req.params.number);
@@ -159,12 +276,11 @@ app.get('/api/sbri/company/:number/full', async (req, res) => {
   }
 });
 
-// GET /api/sbri/company/:number/scored  (v1.3: compute fallback by default)
+// Scored
 app.get('/api/sbri/company/:number/scored', async (req, res) => {
   try {
     const n = String(req.params.number);
 
-    // Base profile (reuse existing logic)
     const base = await db.collection('profiles').findOne({ company_number: n }) || {};
     const profile = await injectBusinessStatus(db, n, base);
     if (!profile.latest_accounts) {
@@ -172,7 +288,6 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
       if (latest) profile.latest_accounts = latest;
     }
 
-    // 1) Try explicit risk score from DB
     let stored = null;
     try {
       const arr = await db.collection('sbri_risk_scores')
@@ -189,7 +304,6 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
       return res.json({ profile, risk: { score, level: score >= 70 ? 'high' : score >= 40 ? 'medium' : 'low', reasons } });
     }
 
-    // 2) Fallback: compute score automatically (NO query param needed)
     const t = Number(profile.latest_accounts?.turnover) || 0;
     const p = Number(profile.latest_accounts?.profit) || 0;
     const margin = t > 0 ? p / t : 0;
@@ -202,10 +316,9 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
                await db.collection('sector_stats').findOne({ sic_code: sic });
     } catch {}
 
-    const rawFail = sector?.failure_rate ?? 0;         // could be 0.018 or 1.8
+    const rawFail = sector?.failure_rate ?? 0;
     const failRate = rawFail > 1 ? rawFail / 100 : rawFail;
 
-    // Heuristic score (0 best → 100 worst)
     const marginPenalty = margin >= 0.15 ? 0 : (margin <= 0 ? 1 : (0.15 - margin) / 0.15);
     const failurePenalty = Math.max(0, Math.min(1, failRate));
     const scoreFloat = 100 * (0.65 * marginPenalty + 0.35 * failurePenalty);
