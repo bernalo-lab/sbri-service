@@ -8,7 +8,10 @@
     "seed:extended": "node scripts/seed-extended.mjs",
     "seed:directors": "node scripts/seed-director-changes.js",
     "seed:company": "node scripts/seed-company.js",
-    "seed:company:clean": "node scripts/seed-company.js --clean-only"
+    "seed:company:clean": "node scripts/seed-company.js --clean-only",
+    "db:init": "node scripts/init-db.js",
+    "db:reseed": "node scripts/init-db.js --reseed",
+    "db:clean": "node scripts/init-db.js --clean"
   },
   "dependencies": {
     "cors": "^2.8.5",
