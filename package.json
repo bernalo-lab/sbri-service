@@ -11,7 +11,8 @@
     "seed:company:clean": "node scripts/seed-company.js --clean-only",
     "db:init": "node scripts/init-db.js",
     "db:reseed": "node scripts/init-db.js --reseed",
-    "db:clean": "node scripts/init-db.js --clean"
+    "db:clean": "node scripts/init-db.js --clean",
+    "seed:sector-stats": "node scripts/seed-sector-stats.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

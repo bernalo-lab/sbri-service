@@ -1,31 +1,42 @@
 // scripts/seed-company.js
-// Version 1.2 — adds CCJ seeding (sbri_ccj_details) + indexes
+// Version 1.4 — adds --assets, profit, liabilities and margin
 import 'dotenv/config';
 import mongoose from 'mongoose';
 
-// If you have an existing Mongoose model for director changes, you can keep it;
-// otherwise this import is optional. We'll operate on raw collections below.
-// import DirectorChange from '../models/DirectorChange.js';
-
 const MONGO_URI = process.env.MONGO_URI;
 
-// -------- CLI args --------
-//   npm run seed:company
-//   npm run seed:company -- 00000006 "SBRI Test Co Ltd" --variant=manufacturing-midlands
-//   npm run seed:company -- 00000006 "SBRI Test Co Ltd" --variant=retail-northwest --clean
-//   npm run seed:company -- 00000006 "SBRI Test Co Ltd" --clean-only
+/*
+Usage:
+  node scripts/seed-company.js 00000007 --name="NEWCO TEST LTD"
+  node scripts/seed-company.js 00000006 "SBRI Test Co Ltd" --variant=tech-london
+  node scripts/seed-company.js 00000006 --name="EXAMPLE LTD" --sic=62020 --region=London
+  node scripts/seed-company.js 00000006 --clean
+  node scripts/seed-company.js 00000006 --clean-only
+*/
+
 const raw = process.argv.slice(2);
-let CN = raw[0] && !raw[0].startsWith('--') ? raw[0] : '00000006';
-let NAME = raw[1] && !raw[1].startsWith('--') ? raw[1] : 'SBRI Test Co Ltd';
-const flags = raw.filter(a => String(a).startsWith('--'));
+
+// positional args
+let CN   = raw[0] && !raw[0].startsWith('--') ? String(raw[0]) : '00000006';
+let NAME = raw[1] && !raw[1].startsWith('--') ? String(raw[1]) : 'SBRI Test Co Ltd';
+
+// flags
+const flags   = raw.filter(a => String(a).startsWith('--'));
 const getFlag = (k, d=null) => (flags.find(f => f.startsWith(`--${k}=`)) || '').split('=').slice(1).join('') || d;
 const hasFlag = (k) => flags.includes(`--${k}`);
 
-const VARIANT = getFlag('variant', 'tech-london');
-const CLEAN = hasFlag('clean');
+const VARIANT    = getFlag('variant', 'tech-london');
+const CLEAN      = hasFlag('clean');
 const CLEAN_ONLY = hasFlag('clean-only');
 
-// -------- Variants --------
+// NEW: explicit overrides
+const NAME_FLAG   = getFlag('name', getFlag('company-name', null));
+const SIC_FLAG    = getFlag('sic', null);
+const REGION_FLAG = getFlag('region', null);
+
+// If --name is supplied, it wins over positional
+if (NAME_FLAG) NAME = String(NAME_FLAG);
+
 const VARIANTS = {
   'tech-london': {
     sic: '62020',
@@ -78,7 +89,7 @@ const VARIANTS = {
     sector: { avg_margin: 0.03, failure_rate: 0.041, sample_size: 2210, period: '2024Q4' },
     accounts: { baseTurnover: 900000, growth: -0.03, margin: 0.03, employees: 8 },
     insolvency: null,
-    ccj: [], // none
+    ccj: [],
     directors: [
       ['2025-05-01','Appointed','Grace Lee','Director','New board appointment'],
       ['2025-04-12','Other','Hao Chen',null,'PSC statement filed']
@@ -102,7 +113,7 @@ async function cleanCompany(db, cn) {
     'filings',
     'insolvency_notices',
     'director_changes',
-    'sbri_ccj_details' // NEW
+    'sbri_ccj_details'
   ];
   for (const c of cols) await db.collection(c).deleteMany({ company_number: cn });
 }
@@ -110,6 +121,10 @@ async function cleanCompany(db, cn) {
 async function run() {
   if (!MONGO_URI) { console.error('❌ Missing MONGO_URI'); process.exit(1); }
   const variant = pickVariant(VARIANT);
+
+  // apply overrides if provided
+  const EFFECTIVE_SIC    = (SIC_FLAG || variant.sic);
+  const EFFECTIVE_REGION = (REGION_FLAG || variant.region);
 
   await mongoose.connect(MONGO_URI);
   const db = mongoose.connection.db;
@@ -127,38 +142,67 @@ async function run() {
     company_name: NAME,
     status: 'active',
     incorporation_date: mkDate(variant.incorporation_date),
-    sic: variant.sic,
+    // keep original field but also add common alternates
+    sic: EFFECTIVE_SIC,
+    sic_codes: EFFECTIVE_SIC ? [EFFECTIVE_SIC] : [],
+    region: EFFECTIVE_REGION || null,
     address: variant.address,
-    jurisdiction: 'uk'
+    jurisdiction: 'uk',
+    updated_at: new Date()
   });
 
   // ---- sbri_business_profiles ----
   await upsert(db.collection('sbri_business_profiles'), { company_number: CN }, {
     company_number: CN,
+    // include name here too for convenience (some UIs key on this)
+    name: NAME,
     sector: variant.sector,
-    region: variant.region,
+    region: EFFECTIVE_REGION || variant.region || null,
     last_updated: new Date()
   });
 
-  // ---- financial_accounts (simple 3-year trail) ----
-  const finCol = db.collection('financial_accounts');
-  const base = variant.accounts.baseTurnover;
-  const growth = variant.accounts.growth;
-  const margin = variant.accounts.margin;
-  const employees = variant.accounts.employees;
-  const years = [2022, 2023, 2024];
-  for (let i=0; i<years.length; i++){
-    const y = years[i];
-    const turnover = Math.round(base * Math.pow(1 + growth, i));
-    const gm = Math.round(turnover * margin);
-    await upsert(finCol, { company_number: CN, period_end: new Date(`${y}-03-31`) }, {
-      company_number: CN,
-      period_end: new Date(`${y}-03-31`),
-      turnover,
-      gross_margin: gm,
-      employees
-    });
+// ---- financial_accounts (simple 3-year trail) ----
+const finCol = db.collection('financial_accounts');
+const sfaExists = await db.listCollections({ name: 'sbri_financial_accounts' }).hasNext();
+const sfaCol = sfaExists ? db.collection('sbri_financial_accounts') : null;
+
+const base = variant.accounts.baseTurnover;   // e.g., 1_100_000
+const growth = variant.accounts.growth;       // e.g., 0.12
+const marginRatio = variant.accounts.margin;  // e.g., 0.12 (12%)
+const employees = variant.accounts.employees; // e.g., 12
+
+const years = [2022, 2023, 2024];             // latest first if you prefer
+for (let i = 0; i < years.length; i++) {
+  const y = years[i];
+  const period_end = new Date(`${y}-03-31`);
+  const turnover = Math.round(base * Math.pow(1 + growth, i));
+
+  // Derivations (simple but plausible defaults)
+  const profit      = Math.round(turnover * marginRatio);        // profit = margin × turnover
+  const assets      = Math.round(turnover * (0.75 + marginRatio/2)); // ~75–80% of sales
+  const liabilities = Math.round(assets * 0.55);                 // ~55% of assets
+  const margin      = marginRatio;                               // store as decimal (0.12 = 12%)
+
+  const doc = {
+    company_number: CN,
+    period_end,
+    turnover,
+    employees,
+    profit,
+    assets,
+    liabilities,
+    margin,
+    // keep for backwards-compat if anything reads it
+    gross_margin: profit,
+    updated_at: new Date()
+  };
+
+  // Write to both collections your UI might read from
+  await finCol.updateOne({ company_number: CN, period_end }, { $set: doc }, { upsert: true });
+  if (sfaCol) {
+    await sfaCol.updateOne({ company_number: CN, period_end }, { $set: doc }, { upsert: true });
   }
+}
 
   // ---- filings ----
   const filings = typeof variant.filings === 'function' ? variant.filings(CN) : [];
@@ -197,7 +241,7 @@ async function run() {
     }
   }
 
-  // ---- NEW: CCJs ----
+  // ---- CCJs (unchanged from v1.2) ----
   if (Array.isArray(variant.ccj) && variant.ccj.length) {
     const ccjCol = db.collection('sbri_ccj_details');
     for (const c of variant.ccj) {
@@ -218,19 +262,18 @@ async function run() {
         { upsert: true }
       );
     }
-    // Helpful indexes (idempotent)
     await ccjCol.createIndex({ company_number: 1, judgment_date: -1 });
     await ccjCol.createIndex({ company_number: 1, status: 1 });
   }
 
-  // ---- Indexes (idempotent) ----
+  // ---- Helpful indexes (idempotent; uniqueness handled by init-db.js) ----
   await db.collection('financial_accounts').createIndex({ company_number: 1, period_end: -1 });
   await db.collection('filings').createIndex({ company_number: 1, filing_date: -1 });
   await db.collection('insolvency_notices').createIndex({ company_number: 1, notice_date: -1 });
   await db.collection('profiles').createIndex({ company_name: 'text' });
   await db.collection('director_changes').createIndex({ company_number: 1, event_date: -1 });
 
-  console.log(`✓ Seeded ${CN} (${NAME}) with variant "${VARIANT}" (incl. CCJ)`);
+  console.log(`✓ Seeded ${CN} (${NAME}) with variant "${VARIANT}"${SIC_FLAG ? ` [SIC=${SIC_FLAG}]` : ''}${REGION_FLAG ? ` [region=${REGION_FLAG}]` : ''}`);
   await mongoose.disconnect();
 }
 
