@@ -1,6 +1,4 @@
 // index.js — SBRI service v1.7.3
-// SIC normalization + bulk sector support + sectors array in /scored
-
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -21,23 +19,17 @@ function normalizeSicArray(obj = {}) {
   const buckets = [];
   const pushMaybe = v => { if (v != null && v !== '') buckets.push(String(v)); };
 
-  // arrays in common shapes
   if (Array.isArray(obj.sic_codes)) buckets.push(...obj.sic_codes.map(String));
   if (Array.isArray(obj.SICCodes))  buckets.push(...obj.SICCodes.map(String));
 
-  // single values / csv-like strings in various shapes
   [
     obj.sic, obj.SIC, obj.sic_code, obj.SICCode,
     obj.primary_sic, obj.sic_codes_text, obj.industry_codes
   ].forEach(pushMaybe);
 
-  // embedded company shape sometimes seen
   if (obj.company?.sic_codes) buckets.push(...[].concat(obj.company.sic_codes));
 
-  // split CSV / whitespace / slashes / semicolons / pipes
   const split = buckets.flatMap(s => String(s).split(/[,\s/;|]+/).filter(Boolean));
-
-  // keep only 4–5 digit tokens
   const codes = split.map(s => s.trim()).filter(s => /^\d{4,5}$/.test(s));
   return uniq(codes);
 }
@@ -56,7 +48,7 @@ async function injectBusinessStatus(db, companyNumber, profileObj) {
     if (s && !profileObj.status) {
       profileObj.status = s[0].toUpperCase() + s.slice(1).toLowerCase();
     }
-  } catch (_) {}
+  } catch {}
   return profileObj;
 }
 
@@ -70,7 +62,7 @@ async function loadLatestAccounts(db, companyNumber) {
         .limit(1)
         .toArray();
       if (arr && arr[0]) return arr[0];
-    } catch (_) {}
+    } catch {}
   }
   return null;
 }
@@ -231,13 +223,13 @@ async function loadDirectorChanges(db, companyNumber, { page = 1, size = 25, fro
       const totalDocs = countDoc[0]?.n || normalized.length;
 
       return { items: normalized, total: totalDocs, summary: s };
-    } catch (_) {}
+    } catch {}
   }
   return { items: [], total: 0, summary: { total: 0, appointments: 0, resignations: 0, other: 0 } };
 }
 
 /* --- SIC thresholds helpers --- */
-const DEFAULT_THRESHOLDS = { high: 70, medium: 40 }; // fallback if none in DB
+const DEFAULT_THRESHOLDS = { high: 70, medium: 40 };
 function classifyRiskWithThresholds(score, thr = DEFAULT_THRESHOLDS) {
   const high = Number(thr?.high ?? 70);
   const med  = Number(thr?.medium ?? 40);
@@ -260,18 +252,17 @@ app.get('/api/sbri/health', async (_req, res) => {
   res.json({ status: 'ok', profiles: profilesCount });
 });
 
-// SEARCH — always return sic_codes[]
+// SEARCH — sic_codes[] normalized
 app.get('/api/sbri/search', async (req, res) => {
   const name = String(req.query.name || '');
   if (!name) return res.json([]);
   const items = await db.collection('profiles')
     .find({ company_name: { $regex: name, $options: 'i' } })
     .limit(50).toArray();
-  const out = items.map(attachNormalizedSIC);
-  res.json(out);
+  res.json(items.map(attachNormalizedSIC));
 });
 
-// COMPANY — normalize & merge SICs from both collections
+// COMPANY — normalize & merge from sbri_business_profiles (no projection)
 app.get('/api/sbri/company/:number', async (req, res) => {
   try {
     const n = String(req.params.number);
@@ -282,8 +273,7 @@ app.get('/api/sbri/company/:number', async (req, res) => {
       if (latest) withStatus.latest_accounts = latest;
     }
     try {
-      const bp = await db.collection('sbri_business_profiles')
-        .findOne({ company_number: n }); // no projection so we can harvest CSV/text fields
+      const bp = await db.collection('sbri_business_profiles').findOne({ company_number: n });
       const merged = { ...withStatus, ...(bp || {}) };
       withStatus.sic_codes = normalizeSicArray(merged);
     } catch {}
@@ -322,24 +312,20 @@ app.get('/api/sbri/company/:number/director-changes', async (req, res) => {
   }
 });
 
-// Sector lookup (single)
+// Sector (single)
 app.get('/api/sbri/sector/:sic', async (req, res) => {
   const doc = await db.collection('sector_stats').findOne({ sic_code: req.params.sic });
   res.json(doc || {});
 });
 
-// Sector lookup (bulk) — NEW
+// Sector (bulk) — NEW
 // GET /api/sbri/sector-bulk?codes=12345,62020&region=London
 app.get('/api/sbri/sector-bulk', async (req, res) => {
   try {
     const codes = String(req.query.codes || '').split(/[,\s]+/).filter(Boolean);
     if (!codes.length) return res.json([]);
     const region = req.query.region ? String(req.query.region) : null;
-
-    const q = region
-      ? { sic_code: { $in: codes }, region }
-      : { sic_code: { $in: codes } };
-
+    const q = region ? { sic_code: { $in: codes }, region } : { sic_code: { $in: codes } };
     const items = await db.collection('sector_stats').find(q).toArray();
     res.json(items);
   } catch {
@@ -347,7 +333,7 @@ app.get('/api/sbri/sector-bulk', async (req, res) => {
   }
 });
 
-// SIC thresholds lookup
+// SIC thresholds
 app.get('/api/sbri/sic-thresholds/:sic', async (req, res) => {
   try {
     const sic = String(req.params.sic);
@@ -367,11 +353,11 @@ app.get('/api/sbri/sic-thresholds/:sic', async (req, res) => {
   }
 });
 
-// Quick classification utility
+// Quick classification utility (fixed typo)
 app.get('/api/sbri/classify', async (req, res) => {
   try {
     const sic = req.query.sic ? String(req.query.sic) : null;
-    the score = Number(req.query.score);
+    const score = Number(req.query.score);
     const region = req.query.region ? String(req.query.region) : null;
     const thrDoc = await loadSicThresholds(sic, region);
     const thresholds = thrDoc?.thresholds || DEFAULT_THRESHOLDS;
@@ -395,7 +381,7 @@ app.get('/api/sbri/company/:number/full', async (req, res) => {
   }
 });
 
-// SCORED — normalize + include all sector rows
+// SCORED — normalize + include ALL sector rows
 app.get('/api/sbri/company/:number/scored', async (req, res) => {
   try {
     const n = String(req.params.number);
@@ -408,7 +394,7 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
 
     // merge/normalize SICs
     try {
-      const bp = await db.collection('sbri_business_profiles').findOne({ company_number: n }); // no projection
+      const bp = await db.collection('sbri_business_profiles').findOne({ company_number: n });
       const merged = { ...profile, ...(bp || {}) };
       profile.sic_codes = normalizeSicArray(merged);
     } catch {}
@@ -422,7 +408,7 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
       stored = arr[0] || null;
     } catch {}
 
-    // derive a score if not stored
+    // derive a score if not stored (using primary SIC sector for failure rate)
     let score, reasons;
     if (stored) {
       score = Number(stored.score);
@@ -454,14 +440,14 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
       ];
     }
 
-    // Industry band uses the first SIC (unchanged)
+    // threshold band uses first SIC (unchanged)
     const primarySic = (profile.sic_codes || [])[0] || null;
     const thrDoc = await loadSicThresholds(primarySic, profile.region);
     const thresholds = thrDoc?.thresholds || DEFAULT_THRESHOLDS;
     const industryBand = classifyRiskWithThresholds(score, thresholds);
     const legacyBand = classifyRiskWithThresholds(score, DEFAULT_THRESHOLDS);
 
-    // NEW: attach all sector rows for all SICs
+    // collect ALL sector rows for ALL SICs
     let sectors = [];
     if (Array.isArray(profile.sic_codes) && profile.sic_codes.length) {
       const q = profile.region
@@ -484,7 +470,7 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
         region: thrDoc?.region ?? profile.region ?? null,
         thresholds_source: thrDoc ? 'db' : 'default'
       },
-      sectors // ← array of sector_stats docs for ALL codes
+      sectors
     });
   } catch {
     res.status(500).json({ error: 'profile_scored_failed' });
@@ -530,7 +516,7 @@ app.get('/api/sbri/company/:number/ccj', async (req, res) => {
     const summary = summaryAgg[0] || { total: 0, total_amount: 0, unsatisfied: 0, latest_judgment_date: null };
 
     res.json({ page, size, summary, items });
-  } catch (e) {
+  } catch {
     res.status(500).json({ error: 'ccj_fetch_failed' });
   }
 });
