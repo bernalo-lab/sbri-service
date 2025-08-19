@@ -1,5 +1,5 @@
-// index.js — SBRI service v1.7.2
-// Adds SIC normalization across payloads; retains SIC thresholds, director changes, CCJ & all baseline routes.
+// index.js — SBRI service v1.7.3
+// SIC normalization + bulk sector support + sectors array in /scored
 
 import express from 'express';
 import cors from 'cors';
@@ -283,7 +283,7 @@ app.get('/api/sbri/company/:number', async (req, res) => {
     }
     try {
       const bp = await db.collection('sbri_business_profiles')
-        .findOne({ company_number: n }); // ← no projection
+        .findOne({ company_number: n }); // no projection so we can harvest CSV/text fields
       const merged = { ...withStatus, ...(bp || {}) };
       withStatus.sic_codes = normalizeSicArray(merged);
     } catch {}
@@ -322,10 +322,29 @@ app.get('/api/sbri/company/:number/director-changes', async (req, res) => {
   }
 });
 
-// Sector lookup (unchanged)
+// Sector lookup (single)
 app.get('/api/sbri/sector/:sic', async (req, res) => {
   const doc = await db.collection('sector_stats').findOne({ sic_code: req.params.sic });
   res.json(doc || {});
+});
+
+// Sector lookup (bulk) — NEW
+// GET /api/sbri/sector-bulk?codes=12345,62020&region=London
+app.get('/api/sbri/sector-bulk', async (req, res) => {
+  try {
+    const codes = String(req.query.codes || '').split(/[,\s]+/).filter(Boolean);
+    if (!codes.length) return res.json([]);
+    const region = req.query.region ? String(req.query.region) : null;
+
+    const q = region
+      ? { sic_code: { $in: codes }, region }
+      : { sic_code: { $in: codes } };
+
+    const items = await db.collection('sector_stats').find(q).toArray();
+    res.json(items);
+  } catch {
+    res.status(500).json({ error: 'sector_bulk_failed' });
+  }
 });
 
 // SIC thresholds lookup
@@ -352,7 +371,7 @@ app.get('/api/sbri/sic-thresholds/:sic', async (req, res) => {
 app.get('/api/sbri/classify', async (req, res) => {
   try {
     const sic = req.query.sic ? String(req.query.sic) : null;
-    const score = Number(req.query.score);
+    the score = Number(req.query.score);
     const region = req.query.region ? String(req.query.region) : null;
     const thrDoc = await loadSicThresholds(sic, region);
     const thresholds = thrDoc?.thresholds || DEFAULT_THRESHOLDS;
@@ -363,7 +382,7 @@ app.get('/api/sbri/classify', async (req, res) => {
   }
 });
 
-// FULL profile (unchanged except normalization is covered by other endpoints)
+// FULL profile
 app.get('/api/sbri/company/:number/full', async (req, res) => {
   try {
     const n = String(req.params.number);
@@ -376,7 +395,7 @@ app.get('/api/sbri/company/:number/full', async (req, res) => {
   }
 });
 
-// SCORED — normalize/merge SICs before banding
+// SCORED — normalize + include all sector rows
 app.get('/api/sbri/company/:number/scored', async (req, res) => {
   try {
     const n = String(req.params.number);
@@ -389,8 +408,7 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
 
     // merge/normalize SICs
     try {
-      const bp = await db.collection('sbri_business_profiles')
-        .findOne({ company_number: n }); // ← no projection
+      const bp = await db.collection('sbri_business_profiles').findOne({ company_number: n }); // no projection
       const merged = { ...profile, ...(bp || {}) };
       profile.sic_codes = normalizeSicArray(merged);
     } catch {}
@@ -414,11 +432,11 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
       const p = Number(profile.latest_accounts?.profit) || 0;
       const margin = t > 0 ? p / t : 0;
 
-      const sic = (profile.sic_codes || [])[0];
+      const primarySic = (profile.sic_codes || [])[0];
       let sector = null;
       try {
-        sector = await db.collection('sector_stats').findOne({ sic_code: sic, region: profile.region }) ||
-                 await db.collection('sector_stats').findOne({ sic_code: sic });
+        sector = await db.collection('sector_stats').findOne({ sic_code: primarySic, region: profile.region }) ||
+                 await db.collection('sector_stats').findOne({ sic_code: primarySic });
       } catch {}
       const rawFail = sector?.failure_rate ?? 0;
       const failRate = rawFail > 1 ? rawFail / 100 : rawFail;
@@ -436,14 +454,21 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
       ];
     }
 
-    // Apply SIC thresholds
-    const sic = (profile.sic_codes || [])[0] || null;
-    const thrDoc = await loadSicThresholds(sic, profile.region);
+    // Industry band uses the first SIC (unchanged)
+    const primarySic = (profile.sic_codes || [])[0] || null;
+    const thrDoc = await loadSicThresholds(primarySic, profile.region);
     const thresholds = thrDoc?.thresholds || DEFAULT_THRESHOLDS;
     const industryBand = classifyRiskWithThresholds(score, thresholds);
-
-    // legacy band for backward compat
     const legacyBand = classifyRiskWithThresholds(score, DEFAULT_THRESHOLDS);
+
+    // NEW: attach all sector rows for all SICs
+    let sectors = [];
+    if (Array.isArray(profile.sic_codes) && profile.sic_codes.length) {
+      const q = profile.region
+        ? { sic_code: { $in: profile.sic_codes }, region: profile.region }
+        : { sic_code: { $in: profile.sic_codes } };
+      sectors = await db.collection('sector_stats').find(q).toArray();
+    }
 
     res.json({
       profile,
@@ -455,10 +480,11 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
         reasons
       },
       industry: {
-        sic_code: sic,
+        sic_code: primarySic,
         region: thrDoc?.region ?? profile.region ?? null,
         thresholds_source: thrDoc ? 'db' : 'default'
-      }
+      },
+      sectors // ← array of sector_stats docs for ALL codes
     });
   } catch {
     res.status(500).json({ error: 'profile_scored_failed' });
@@ -510,5 +536,5 @@ app.get('/api/sbri/company/:number/ccj', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log(`SBRI service running on port ${process.env.PORT || 3000} (v1.7.1)`);
+  console.log(`SBRI service running on port ${process.env.PORT || 3000} (v1.7.3)`);
 });
