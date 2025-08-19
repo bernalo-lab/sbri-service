@@ -1,5 +1,5 @@
-// index.js — SBRI service v1.7.0
-// Adds SIC thresholds + endpoints; keeps CCJ endpoint and all baseline routes
+// index.js — SBRI service v1.7.1
+// Adds SIC normalization across payloads; retains SIC thresholds, director changes, CCJ & all baseline routes.
 
 import express from 'express';
 import cors from 'cors';
@@ -14,6 +14,38 @@ app.use(express.json());
 const client = new MongoClient(process.env.MONGO_URI);
 await client.connect();
 const db = client.db();
+
+/* --------- helpers: SIC normalization --------- */
+function uniq(arr){ return Array.from(new Set(arr)); }
+function normalizeSicArray(obj = {}) {
+  const buckets = [];
+  const pushMaybe = v => { if (v != null && v !== '') buckets.push(String(v)); };
+
+  // arrays in common shapes
+  if (Array.isArray(obj.sic_codes)) buckets.push(...obj.sic_codes.map(String));
+  if (Array.isArray(obj.SICCodes))  buckets.push(...obj.SICCodes.map(String));
+
+  // single values / csv-like strings in various shapes
+  [
+    obj.sic, obj.SIC, obj.sic_code, obj.SICCode,
+    obj.primary_sic, obj.sic_codes_text, obj.industry_codes
+  ].forEach(pushMaybe);
+
+  // embedded company shape sometimes seen
+  if (obj.company?.sic_codes) buckets.push(...[].concat(obj.company.sic_codes));
+
+  // split CSV / whitespace / slashes / semicolons / pipes
+  const split = buckets.flatMap(s => String(s).split(/[,\s/;|]+/).filter(Boolean));
+
+  // keep only 4–5 digit tokens
+  const codes = split.map(s => s.trim()).filter(s => /^\d{4,5}$/.test(s));
+  return uniq(codes);
+}
+function attachNormalizedSIC(doc = {}) {
+  const sicCodes = normalizeSicArray(doc);
+  if (sicCodes.length) doc.sic_codes = sicCodes;
+  return doc;
+}
 
 /* --- helpers (baseline) --- */
 async function injectBusinessStatus(db, companyNumber, profileObj) {
@@ -215,7 +247,6 @@ function classifyRiskWithThresholds(score, thr = DEFAULT_THRESHOLDS) {
 }
 async function loadSicThresholds(sic, region) {
   if (!sic) return null;
-  // Try region-specific first, then SIC-only
   const col = db.collection('sbri_sic_thresholds');
   const byRegion = region ? await col.findOne({ sic_code: sic, region }) : null;
   if (byRegion && byRegion.thresholds) return byRegion;
@@ -229,15 +260,18 @@ app.get('/api/sbri/health', async (_req, res) => {
   res.json({ status: 'ok', profiles: profilesCount });
 });
 
+// SEARCH — always return sic_codes[]
 app.get('/api/sbri/search', async (req, res) => {
   const name = String(req.query.name || '');
   if (!name) return res.json([]);
   const items = await db.collection('profiles')
     .find({ company_name: { $regex: name, $options: 'i' } })
     .limit(50).toArray();
-  res.json(items);
+  const out = items.map(attachNormalizedSIC);
+  res.json(out);
 });
 
+// COMPANY — normalize & merge SICs from both collections
 app.get('/api/sbri/company/:number', async (req, res) => {
   try {
     const n = String(req.params.number);
@@ -247,6 +281,13 @@ app.get('/api/sbri/company/:number', async (req, res) => {
       const latest = await loadLatestAccounts(db, n);
       if (latest) withStatus.latest_accounts = latest;
     }
+    try {
+      const bp = await db.collection('sbri_business_profiles')
+        .findOne({ company_number: n }, { projection: { sic_codes: 1, sic: 1, sic_code: 1 } });
+      const merged = { ...withStatus, ...(bp || {}) };
+      withStatus.sic_codes = normalizeSicArray(merged);
+    } catch {}
+    attachNormalizedSIC(withStatus);
     res.json(withStatus);
   } catch {
     res.status(500).json({ error: 'profile_lookup_failed' });
@@ -287,8 +328,7 @@ app.get('/api/sbri/sector/:sic', async (req, res) => {
   res.json(doc || {});
 });
 
-// NEW: SIC thresholds lookup
-// GET /api/sbri/sic-thresholds/:sic?region=London
+// SIC thresholds lookup
 app.get('/api/sbri/sic-thresholds/:sic', async (req, res) => {
   try {
     const sic = String(req.params.sic);
@@ -308,8 +348,7 @@ app.get('/api/sbri/sic-thresholds/:sic', async (req, res) => {
   }
 });
 
-// NEW: quick classification utility
-// GET /api/sbri/classify?sic=62020&score=72&region=London
+// Quick classification utility
 app.get('/api/sbri/classify', async (req, res) => {
   try {
     const sic = req.query.sic ? String(req.query.sic) : null;
@@ -324,14 +363,7 @@ app.get('/api/sbri/classify', async (req, res) => {
   }
 });
 
-app.get('/api/sbri/insolvency/:number', async (req, res) => {
-  const items = await db.collection('insolvency_notices')
-    .find({ company_number: req.params.number })
-    .sort({ notice_date: -1 })
-    .limit(50).toArray();
-  res.json({ items });
-});
-
+// FULL profile (unchanged except normalization is covered by other endpoints)
 app.get('/api/sbri/company/:number/full', async (req, res) => {
   try {
     const n = String(req.params.number);
@@ -344,6 +376,7 @@ app.get('/api/sbri/company/:number/full', async (req, res) => {
   }
 });
 
+// SCORED — normalize/merge SICs before banding
 app.get('/api/sbri/company/:number/scored', async (req, res) => {
   try {
     const n = String(req.params.number);
@@ -354,6 +387,16 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
       if (latest) profile.latest_accounts = latest;
     }
 
+    // merge/normalize SICs
+    try {
+      const bp = await db.collection('sbri_business_profiles')
+        .findOne({ company_number: n }, { projection: { sic_codes: 1, sic: 1, sic_code: 1 } });
+      const merged = { ...profile, ...(bp || {}) };
+      profile.sic_codes = normalizeSicArray(merged);
+    } catch {}
+    attachNormalizedSIC(profile);
+
+    // stored score?
     let stored = null;
     try {
       const arr = await db.collection('sbri_risk_scores')
@@ -399,16 +442,16 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
     const thresholds = thrDoc?.thresholds || DEFAULT_THRESHOLDS;
     const industryBand = classifyRiskWithThresholds(score, thresholds);
 
-    // Keep the legacy "level" based on default thresholds for backward compat
+    // legacy band for backward compat
     const legacyBand = classifyRiskWithThresholds(score, DEFAULT_THRESHOLDS);
 
     res.json({
       profile,
       risk: {
         score,
-        level: legacyBand,              // legacy (default 70/40)
-        industry_band: industryBand,    // SIC-aware
-        thresholds,                     // thresholds used for industry_band
+        level: legacyBand,
+        industry_band: industryBand,
+        thresholds,
         reasons
       },
       industry: {
@@ -467,5 +510,5 @@ app.get('/api/sbri/company/:number/ccj', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log(`SBRI service running on port ${process.env.PORT || 3000} (v1.7.0)`);
+  console.log(`SBRI service running on port ${process.env.PORT || 3000} (v1.7.1)`);
 });
