@@ -1,5 +1,5 @@
-// index.js — SBRI service v1.6.2
-// Baseline preserved. Adds CCJ endpoint: GET /api/sbri/company/:number/ccj
+// index.js — SBRI service v1.7.0
+// Adds SIC thresholds + endpoints; keeps CCJ endpoint and all baseline routes
 
 import express from 'express';
 import cors from 'cors';
@@ -15,7 +15,7 @@ const client = new MongoClient(process.env.MONGO_URI);
 await client.connect();
 const db = client.db();
 
-/* --- helpers kept from your baseline --- */
+/* --- helpers (baseline) --- */
 async function injectBusinessStatus(db, companyNumber, profileObj) {
   try {
     const doc = await db.collection('sbri_business_profiles')
@@ -43,7 +43,7 @@ async function loadLatestAccounts(db, companyNumber) {
   return null;
 }
 
-/* --- Director changes with date range + summary (baseline) --- */
+/* --- director changes helpers (baseline) --- */
 function coalesceDateStage() {
   const fields = [
     'effective_date','event_date','change_date','date',
@@ -204,7 +204,26 @@ async function loadDirectorChanges(db, companyNumber, { page = 1, size = 25, fro
   return { items: [], total: 0, summary: { total: 0, appointments: 0, resignations: 0, other: 0 } };
 }
 
-/* --- endpoints (baseline preserved) --- */
+/* --- SIC thresholds helpers --- */
+const DEFAULT_THRESHOLDS = { high: 70, medium: 40 }; // fallback if none in DB
+function classifyRiskWithThresholds(score, thr = DEFAULT_THRESHOLDS) {
+  const high = Number(thr?.high ?? 70);
+  const med  = Number(thr?.medium ?? 40);
+  if (score >= high) return 'high';
+  if (score >= med)  return 'medium';
+  return 'low';
+}
+async function loadSicThresholds(sic, region) {
+  if (!sic) return null;
+  // Try region-specific first, then SIC-only
+  const col = db.collection('sbri_sic_thresholds');
+  const byRegion = region ? await col.findOne({ sic_code: sic, region }) : null;
+  if (byRegion && byRegion.thresholds) return byRegion;
+  const generic = await col.findOne({ sic_code: sic, region: null }) || await col.findOne({ sic_code: sic });
+  return generic || null;
+}
+
+/* --- endpoints --- */
 app.get('/api/sbri/health', async (_req, res) => {
   const profilesCount = await db.collection('profiles').countDocuments();
   res.json({ status: 'ok', profiles: profilesCount });
@@ -247,7 +266,7 @@ app.get('/api/sbri/company/:number/filings', async (req, res) => {
   res.json({ page, size, items });
 });
 
-// Director changes (baseline + range)
+// Director changes
 app.get('/api/sbri/company/:number/director-changes', async (req, res) => {
   try {
     const page = Math.max(1, Number(req.query.page || 1));
@@ -262,9 +281,47 @@ app.get('/api/sbri/company/:number/director-changes', async (req, res) => {
   }
 });
 
+// Sector lookup (unchanged)
 app.get('/api/sbri/sector/:sic', async (req, res) => {
   const doc = await db.collection('sector_stats').findOne({ sic_code: req.params.sic });
   res.json(doc || {});
+});
+
+// NEW: SIC thresholds lookup
+// GET /api/sbri/sic-thresholds/:sic?region=London
+app.get('/api/sbri/sic-thresholds/:sic', async (req, res) => {
+  try {
+    const sic = String(req.params.sic);
+    const region = req.query.region ? String(req.query.region) : null;
+    const doc = await loadSicThresholds(sic, region);
+    if (!doc) return res.json({ sic_code: sic, region: region || null, thresholds: DEFAULT_THRESHOLDS, source: 'default' });
+    res.json({
+      sic_code: doc.sic_code,
+      region: doc.region ?? null,
+      thresholds: doc.thresholds || DEFAULT_THRESHOLDS,
+      note: doc.note || null,
+      updated_at: doc.updated_at || null,
+      source: 'db'
+    });
+  } catch {
+    res.status(500).json({ error: 'sic_thresholds_failed' });
+  }
+});
+
+// NEW: quick classification utility
+// GET /api/sbri/classify?sic=62020&score=72&region=London
+app.get('/api/sbri/classify', async (req, res) => {
+  try {
+    const sic = req.query.sic ? String(req.query.sic) : null;
+    const score = Number(req.query.score);
+    const region = req.query.region ? String(req.query.region) : null;
+    const thrDoc = await loadSicThresholds(sic, region);
+    const thresholds = thrDoc?.thresholds || DEFAULT_THRESHOLDS;
+    const band = classifyRiskWithThresholds(score, thresholds);
+    res.json({ sic_code: sic, region: thrDoc?.region ?? region ?? null, score, thresholds, band });
+  } catch {
+    res.status(500).json({ error: 'classify_failed' });
+  }
 });
 
 app.get('/api/sbri/insolvency/:number', async (req, res) => {
@@ -304,47 +361,68 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
       stored = arr[0] || null;
     } catch {}
 
+    // derive a score if not stored
+    let score, reasons;
     if (stored) {
-      const score = Number(stored.score);
-      const reasons = Array.isArray(stored.reasons) ? stored.reasons : [];
-      return res.json({ profile, risk: { score, level: score >= 70 ? 'high' : score >= 40 ? 'medium' : 'low', reasons } });
+      score = Number(stored.score);
+      reasons = Array.isArray(stored.reasons) ? stored.reasons : [];
+    } else {
+      const t = Number(profile.latest_accounts?.turnover) || 0;
+      const p = Number(profile.latest_accounts?.profit) || 0;
+      const margin = t > 0 ? p / t : 0;
+
+      const sic = (profile.sic_codes || [])[0];
+      let sector = null;
+      try {
+        sector = await db.collection('sector_stats').findOne({ sic_code: sic, region: profile.region }) ||
+                 await db.collection('sector_stats').findOne({ sic_code: sic });
+      } catch {}
+      const rawFail = sector?.failure_rate ?? 0;
+      const failRate = rawFail > 1 ? rawFail / 100 : rawFail;
+
+      const marginPenalty = margin >= 0.15 ? 0 : (margin <= 0 ? 1 : (0.15 - margin) / 0.15);
+      const failurePenalty = Math.max(0, Math.min(1, failRate));
+      const scoreFloat = 100 * (0.65 * marginPenalty + 0.35 * failurePenalty);
+      score = Math.max(0, Math.min(100, Math.round(scoreFloat)));
+      const level = score >= 70 ? 'high' : score >= 40 ? 'medium' : 'low';
+
+      reasons = [
+        `Gross margin ~ ${(margin * 100).toFixed(1)}%`,
+        `Sector failure ~ ${(failurePenalty * 100).toFixed(1)}%`,
+        level === 'high' ? 'High risk band' : level === 'medium' ? 'Medium risk band' : 'Low risk band'
+      ];
     }
 
-    const t = Number(profile.latest_accounts?.turnover) || 0;
-    const p = Number(profile.latest_accounts?.profit) || 0;
-    const margin = t > 0 ? p / t : 0;
+    // Apply SIC thresholds
+    const sic = (profile.sic_codes || [])[0] || null;
+    const thrDoc = await loadSicThresholds(sic, profile.region);
+    const thresholds = thrDoc?.thresholds || DEFAULT_THRESHOLDS;
+    const industryBand = classifyRiskWithThresholds(score, thresholds);
 
-    const sic = (profile.sic_codes || [])[0];
-    let sector = null;
-    try {
-      sector = await db.collection('sector_stats').findOne({ sic_code: sic, region: profile.region }) ||
-               await db.collection('sector_stats').findOne({ sic_code: sic });
-    } catch {}
-    const rawFail = sector?.failure_rate ?? 0;
-    const failRate = rawFail > 1 ? rawFail / 100 : rawFail;
+    // Keep the legacy "level" based on default thresholds for backward compat
+    const legacyBand = classifyRiskWithThresholds(score, DEFAULT_THRESHOLDS);
 
-    const marginPenalty = margin >= 0.15 ? 0 : (margin <= 0 ? 1 : (0.15 - margin) / 0.15);
-    const failurePenalty = Math.max(0, Math.min(1, failRate));
-    const scoreFloat = 100 * (0.65 * marginPenalty + 0.35 * failurePenalty);
-    const score = Math.max(0, Math.min(100, Math.round(scoreFloat)));
-    const level = score >= 70 ? 'high' : score >= 40 ? 'medium' : 'low';
-
-    const reasons = [
-      `Gross margin ~ ${(margin * 100).toFixed(1)}%`,
-      `Sector failure ~ ${(failurePenalty * 100).toFixed(1)}%`,
-      level === 'high' ? 'High risk band' : level === 'medium' ? 'Medium risk band' : 'Low risk band'
-    ];
-
-    res.json({ profile, risk: { score, level, reasons } });
+    res.json({
+      profile,
+      risk: {
+        score,
+        level: legacyBand,              // legacy (default 70/40)
+        industry_band: industryBand,    // SIC-aware
+        thresholds,                     // thresholds used for industry_band
+        reasons
+      },
+      industry: {
+        sic_code: sic,
+        region: thrDoc?.region ?? profile.region ?? null,
+        thresholds_source: thrDoc ? 'db' : 'default'
+      }
+    });
   } catch {
     res.status(500).json({ error: 'profile_scored_failed' });
   }
 });
 
-/* --- NEW: CCJ endpoint (paged list + summary) --- */
-// Collection: sbri_ccj_details
-// Doc shape (suggested):
-// { company_number, judgment_date: Date, amount: Number, court, case_number, status: 'open'|'unsatisfied'|'satisfied', satisfied_date: Date|null, source }
+/* --- CCJ endpoint (baseline retained) --- */
 app.get('/api/sbri/company/:number/ccj', async (req, res) => {
   try {
     const n = String(req.params.number);
@@ -389,5 +467,5 @@ app.get('/api/sbri/company/:number/ccj', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log(`SBRI service running on port ${process.env.PORT || 3000} (v1.6.2)`);
+  console.log(`SBRI service running on port ${process.env.PORT || 3000} (v1.7.0)`);
 });

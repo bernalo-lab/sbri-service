@@ -1,5 +1,5 @@
 // scripts/seed-company.js
-// Version 1.4 — adds --assets, profit, liabilities and margin
+// Version 1.5 — adds sector_stats + sbri_sic_thresholds seeding and SIC threshold overrides
 import 'dotenv/config';
 import mongoose from 'mongoose';
 
@@ -12,6 +12,8 @@ Usage:
   node scripts/seed-company.js 00000006 --name="EXAMPLE LTD" --sic=62020 --region=London
   node scripts/seed-company.js 00000006 --clean
   node scripts/seed-company.js 00000006 --clean-only
+  # NEW: SIC threshold overrides (score scale 0–100, higher = higher risk)
+  node scripts/seed-company.js 00000006 --sic=62020 --sic-high=65 --sic-medium=35
 */
 
 const raw = process.argv.slice(2);
@@ -30,12 +32,24 @@ const CLEAN      = hasFlag('clean');
 const CLEAN_ONLY = hasFlag('clean-only');
 
 // NEW: explicit overrides
-const NAME_FLAG   = getFlag('name', getFlag('company-name', null));
-const SIC_FLAG    = getFlag('sic', null);
-const REGION_FLAG = getFlag('region', null);
+const NAME_FLAG    = getFlag('name', getFlag('company-name', null));
+const SIC_FLAG     = getFlag('sic', null);
+const REGION_FLAG  = getFlag('region', null);
+const SIC_HIGH_RAW = getFlag('sic-high', null);
+const SIC_MED_RAW  = getFlag('sic-medium', null);
 
 // If --name is supplied, it wins over positional
 if (NAME_FLAG) NAME = String(NAME_FLAG);
+
+// Default per-SIC thresholds (higher score = higher risk)
+// 'high' => score >= high → High risk
+// 'medium' => score >= medium → Medium risk, else Low
+const DEFAULT_THRESHOLDS = {
+  '62020': { high: 65, medium: 35 }, // IT consulting often healthier margins
+  '28290': { high: 75, medium: 45 }, // Manufacturing more volatile
+  '47190': { high: 70, medium: 40 }, // Retail mid-high risk
+  default: { high: 70, medium: 40 }
+};
 
 const VARIANTS = {
   'tech-london': {
@@ -113,9 +127,11 @@ async function cleanCompany(db, cn) {
     'filings',
     'insolvency_notices',
     'director_changes',
-    'sbri_ccj_details'
+    'sbri_ccj_details',
+    'sector_stats',
+    'sbri_sic_thresholds'
   ];
-  for (const c of cols) await db.collection(c).deleteMany({ company_number: cn });
+  for (const c of cols) await db.collection(c).deleteMany({ company_number: cn, ...(c==='sector_stats'||c==='sbri_sic_thresholds' ? {} : {}) });
 }
 
 async function run() {
@@ -125,6 +141,9 @@ async function run() {
   // apply overrides if provided
   const EFFECTIVE_SIC    = (SIC_FLAG || variant.sic);
   const EFFECTIVE_REGION = (REGION_FLAG || variant.region);
+
+  const SIC_HIGH = SIC_HIGH_RAW != null ? Number(SIC_HIGH_RAW) : (DEFAULT_THRESHOLDS[EFFECTIVE_SIC]?.high ?? DEFAULT_THRESHOLDS.default.high);
+  const SIC_MED  = SIC_MED_RAW  != null ? Number(SIC_MED_RAW)  : (DEFAULT_THRESHOLDS[EFFECTIVE_SIC]?.medium ?? DEFAULT_THRESHOLDS.default.medium);
 
   await mongoose.connect(MONGO_URI);
   const db = mongoose.connection.db;
@@ -142,7 +161,6 @@ async function run() {
     company_name: NAME,
     status: 'active',
     incorporation_date: mkDate(variant.incorporation_date),
-    // keep original field but also add common alternates
     sic: EFFECTIVE_SIC,
     sic_codes: EFFECTIVE_SIC ? [EFFECTIVE_SIC] : [],
     region: EFFECTIVE_REGION || null,
@@ -154,55 +172,83 @@ async function run() {
   // ---- sbri_business_profiles ----
   await upsert(db.collection('sbri_business_profiles'), { company_number: CN }, {
     company_number: CN,
-    // include name here too for convenience (some UIs key on this)
     name: NAME,
     sector: variant.sector,
     region: EFFECTIVE_REGION || variant.region || null,
     last_updated: new Date()
   });
 
-// ---- financial_accounts (simple 3-year trail) ----
-const finCol = db.collection('financial_accounts');
-const sfaExists = await db.listCollections({ name: 'sbri_financial_accounts' }).hasNext();
-const sfaCol = sfaExists ? db.collection('sbri_financial_accounts') : null;
-
-const base = variant.accounts.baseTurnover;   // e.g., 1_100_000
-const growth = variant.accounts.growth;       // e.g., 0.12
-const marginRatio = variant.accounts.margin;  // e.g., 0.12 (12%)
-const employees = variant.accounts.employees; // e.g., 12
-
-const years = [2022, 2023, 2024];             // latest first if you prefer
-for (let i = 0; i < years.length; i++) {
-  const y = years[i];
-  const period_end = new Date(`${y}-03-31`);
-  const turnover = Math.round(base * Math.pow(1 + growth, i));
-
-  // Derivations (simple but plausible defaults)
-  const profit      = Math.round(turnover * marginRatio);        // profit = margin × turnover
-  const assets      = Math.round(turnover * (0.75 + marginRatio/2)); // ~75–80% of sales
-  const liabilities = Math.round(assets * 0.55);                 // ~55% of assets
-  const margin      = marginRatio;                               // store as decimal (0.12 = 12%)
-
-  const doc = {
-    company_number: CN,
-    period_end,
-    turnover,
-    employees,
-    profit,
-    assets,
-    liabilities,
-    margin,
-    // keep for backwards-compat if anything reads it
-    gross_margin: profit,
-    updated_at: new Date()
-  };
-
-  // Write to both collections your UI might read from
-  await finCol.updateOne({ company_number: CN, period_end }, { $set: doc }, { upsert: true });
-  if (sfaCol) {
-    await sfaCol.updateOne({ company_number: CN, period_end }, { $set: doc }, { upsert: true });
+  // ---- sector_stats (for /api/sbri/sector/:sic) ----
+  if (variant.sector) {
+    await upsert(
+      db.collection('sector_stats'),
+      { sic_code: EFFECTIVE_SIC, region: EFFECTIVE_REGION || null },
+      {
+        sic_code: EFFECTIVE_SIC,
+        region: EFFECTIVE_REGION || null,
+        avg_margin: variant.sector.avg_margin,
+        failure_rate: variant.sector.failure_rate,
+        sample_size: variant.sector.sample_size,
+        period: variant.sector.period,
+        updated_at: new Date()
+      }
+    );
+    await db.collection('sector_stats').createIndex({ sic_code: 1, region: 1 });
   }
-}
+
+  // ---- sbri_sic_thresholds (industry bands per SIC/region) ----
+  await upsert(
+    db.collection('sbri_sic_thresholds'),
+    { sic_code: EFFECTIVE_SIC, region: EFFECTIVE_REGION || null },
+    {
+      sic_code: EFFECTIVE_SIC,
+      region: EFFECTIVE_REGION || null,
+      thresholds: { high: SIC_HIGH, medium: SIC_MED },
+      note: 'Seeded by seed-company v1.5',
+      updated_at: new Date()
+    }
+  );
+  await db.collection('sbri_sic_thresholds').createIndex({ sic_code: 1, region: 1 });
+
+  // ---- financial_accounts (simple 3-year trail) ----
+  const finCol = db.collection('financial_accounts');
+  const sfaExists = await db.listCollections({ name: 'sbri_financial_accounts' }).hasNext();
+  const sfaCol = sfaExists ? db.collection('sbri_financial_accounts') : null;
+
+  const base = variant.accounts.baseTurnover;
+  const growth = variant.accounts.growth;
+  const marginRatio = variant.accounts.margin;
+  const employees = variant.accounts.employees;
+
+  const years = [2022, 2023, 2024];
+  for (let i = 0; i < years.length; i++) {
+    const y = years[i];
+    const period_end = new Date(`${y}-03-31`);
+    const turnover = Math.round(base * Math.pow(1 + growth, i));
+
+    const profit      = Math.round(turnover * marginRatio);
+    const assets      = Math.round(turnover * (0.75 + marginRatio/2));
+    const liabilities = Math.round(assets * 0.55);
+    const margin      = marginRatio;
+
+    const doc = {
+      company_number: CN,
+      period_end,
+      turnover,
+      employees,
+      profit,
+      assets,
+      liabilities,
+      margin,
+      gross_margin: profit,
+      updated_at: new Date()
+    };
+
+    await finCol.updateOne({ company_number: CN, period_end }, { $set: doc }, { upsert: true });
+    if (sfaCol) {
+      await sfaCol.updateOne({ company_number: CN, period_end }, { $set: doc }, { upsert: true });
+    }
+  }
 
   // ---- filings ----
   const filings = typeof variant.filings === 'function' ? variant.filings(CN) : [];
@@ -241,7 +287,7 @@ for (let i = 0; i < years.length; i++) {
     }
   }
 
-  // ---- CCJs (unchanged from v1.2) ----
+  // ---- CCJs ----
   if (Array.isArray(variant.ccj) && variant.ccj.length) {
     const ccjCol = db.collection('sbri_ccj_details');
     for (const c of variant.ccj) {
@@ -266,14 +312,14 @@ for (let i = 0; i < years.length; i++) {
     await ccjCol.createIndex({ company_number: 1, status: 1 });
   }
 
-  // ---- Helpful indexes (idempotent; uniqueness handled by init-db.js) ----
+  // ---- Helpful indexes ----
   await db.collection('financial_accounts').createIndex({ company_number: 1, period_end: -1 });
   await db.collection('filings').createIndex({ company_number: 1, filing_date: -1 });
   await db.collection('insolvency_notices').createIndex({ company_number: 1, notice_date: -1 });
   await db.collection('profiles').createIndex({ company_name: 'text' });
   await db.collection('director_changes').createIndex({ company_number: 1, event_date: -1 });
 
-  console.log(`✓ Seeded ${CN} (${NAME}) with variant "${VARIANT}"${SIC_FLAG ? ` [SIC=${SIC_FLAG}]` : ''}${REGION_FLAG ? ` [region=${REGION_FLAG}]` : ''}`);
+  console.log(`✓ Seeded ${CN} (${NAME}) with variant "${VARIANT}" [SIC=${EFFECTIVE_SIC}] [region=${EFFECTIVE_REGION || '—'}] thresholds(high=${SIC_HIGH}, medium=${SIC_MED})`);
   await mongoose.disconnect();
 }
 
