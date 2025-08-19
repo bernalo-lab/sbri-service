@@ -1,7 +1,8 @@
-// index.js — SBRI service v1.7.3
+// index.js — SBRI service v1.8.0 (Live‑Data Pilot)
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import fetch from 'node-fetch';
 import { MongoClient } from 'mongodb';
 
 dotenv.config();
@@ -246,13 +247,162 @@ async function loadSicThresholds(sic, region) {
   return generic || null;
 }
 
-/* --- endpoints --- */
+/* -------------------- LIVE DATA PROXY (Companies House) -------------------- */
+const CH_BASE = 'https://api.company-information.service.gov.uk';
+const CH_KEY  = process.env.CH_API_KEY || '';
+const RAW_ALLOW = (process.env.CH_ALLOWLIST || '').split(/[,\s]+/).filter(Boolean);
+const ALLOW_SET = new Set(RAW_ALLOW.map(s => s.trim()));
+const RATE_PER_MIN = Number(process.env.CH_RATE_PER_MIN || 60);
+let tokens = RATE_PER_MIN;
+let lastRefill = Date.now();
+function takeToken() {
+  const now = Date.now();
+  const elapsed = (now - lastRefill) / 60000;
+  if (elapsed >= 1) {
+    tokens = RATE_PER_MIN;
+    lastRefill = now;
+  }
+  if (tokens <= 0) return false;
+  tokens -= 1;
+  return true;
+}
+function ensureAllowed(number) {
+  if (!ALLOW_SET.size) return false;
+  return ALLOW_SET.has(String(number));
+}
+async function chFetch(path) {
+  if (!CH_KEY) throw new Error('missing_ch_api_key');
+  if (!takeToken()) {
+    const err = new Error('rate_limited');
+    err.code = 429;
+    throw err;
+  }
+  const res = await fetch(`${CH_BASE}${path}`, {
+    headers: {
+      'Accept': 'application/json',
+      'Authorization': 'Basic ' + Buffer.from(`${CH_KEY}:`).toString('base64')
+    }
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    const e = new Error(`ch_${res.status}`);
+    e.status = res.status;
+    e.body = text.slice(0, 500);
+    throw e;
+  }
+  return res.json();
+}
+function mapCHSearchItem(x = {}) {
+  return {
+    company_number: x.company_number,
+    company_name: x.title,
+    registered_office_address: {
+      locality: x.address_snippet || ''
+    },
+    sic_codes: (x.sic_codes || [])
+  };
+}
+function mapCHCompanyProfile(x = {}) {
+  return {
+    company_number: x.company_number,
+    company_name: x.company_name,
+    status: x.company_status,
+    registered_office_address: x.registered_office_address || {},
+    sic_codes: x.sic_codes || [],
+    region: x.registered_office_address?.locality || null,
+    accounts: {
+      latest: {
+        made_up_to: x.accounts?.last_accounts?.made_up_to || null,
+        next_due: x.accounts?.next_due || null
+      }
+    }
+  };
+}
+function mapCHFilings(x = {}) {
+  const items = Array.isArray(x.items) ? x.items : [];
+  return {
+    items: items.map(it => ({
+      date: it.date,
+      filing_date: it.date,
+      category: it.category,
+      description: it.description || it.type || ''
+    }))
+  };
+}
+function mapCHOfficers(x = {}) {
+  const items = Array.isArray(x.items) ? x.items : [];
+  const mapped = items.map(it => ({
+    date: it.appointed_on || it.resigned_on || it.notified_on || it.date_of_birth || it.updated_at || null,
+    type: it.resigned_on ? 'Resigned' : 'Appointed',
+    name: it.name,
+    role: it.officer_role,
+    details: it.nationality || it.occupation || ''
+  }));
+  const summary = {
+    total: mapped.length,
+    appointments: mapped.filter(m => m.type === 'Appointed').length,
+    resignations: mapped.filter(m => m.type === 'Resigned').length,
+    other: 0
+  };
+  return { items: mapped, summary };
+}
+
+app.get('/api/live/allow-list', (req, res) => {
+  res.json({ allowed: Array.from(ALLOW_SET).sort() });
+});
+app.get('/api/live/search', async (req, res) => {
+  try {
+    const q = String(req.query.name || '');
+    if (!q) return res.json([]);
+    const data = await chFetch(`/search/companies?q=${encodeURIComponent(q)}&items_per_page=25`);
+    const items = (data.items || []).map(mapCHSearchItem);
+    res.json(items);
+  } catch (e) {
+    const code = e.code === 429 || e.status === 429 ? 429 : 500;
+    res.status(code).json({ error: 'live_search_failed', detail: e.message, body: e.body || null });
+  }
+});
+app.get('/api/live/company/:number', async (req, res) => {
+  try {
+    const n = String(req.params.number);
+    if (!ensureAllowed(n)) return res.status(403).json({ error: 'not_allow_listed' });
+    const data = await chFetch(`/company/${encodeURIComponent(n)}`);
+    res.json(attachNormalizedSIC(mapCHCompanyProfile(data)));
+  } catch (e) {
+    const code = e.code === 429 || e.status === 429 ? 429 : 500;
+    res.status(code).json({ error: 'live_company_failed', detail: e.message, body: e.body || null });
+  }
+});
+app.get('/api/live/company/:number/filings', async (req, res) => {
+  try {
+    const n = String(req.params.number);
+    if (!ensureAllowed(n)) return res.status(403).json({ error: 'not_allow_listed' });
+    const page = Math.max(1, Number(req.query.page || 1));
+    const size = Math.min(100, Number(req.query.size || 25));
+    const data = await chFetch(`/company/${encodeURIComponent(n)}/filing-history?items_per_page=${size}&start_index=${(page-1)*size}`);
+    res.json(mapCHFilings(data));
+  } catch (e) {
+    const code = e.code === 429 || e.status === 429 ? 429 : 500;
+    res.status(code).json({ error: 'live_filings_failed', detail: e.message, body: e.body || null });
+  }
+});
+app.get('/api/live/company/:number/officers', async (req, res) => {
+  try {
+    const n = String(req.params.number);
+    if (!ensureAllowed(n)) return res.status(403).json({ error: 'not_allow_listed' });
+    const data = await chFetch(`/company/${encodeURIComponent(n)}/officers?items_per_page=100`);
+    res.json(mapCHOfficers(data));
+  } catch (e) {
+    const code = e.code === 429 || e.status === 429 ? 429 : 500;
+    res.status(code).json({ error: 'live_officers_failed', detail: e.message, body: e.body || null });
+  }
+});
+
+/* -------------------- EXISTING SBRI (test data) -------------------- */
 app.get('/api/sbri/health', async (_req, res) => {
   const profilesCount = await db.collection('profiles').countDocuments();
   res.json({ status: 'ok', profiles: profilesCount });
 });
-
-// SEARCH — sic_codes[] normalized
 app.get('/api/sbri/search', async (req, res) => {
   const name = String(req.query.name || '');
   if (!name) return res.json([]);
@@ -261,8 +411,6 @@ app.get('/api/sbri/search', async (req, res) => {
     .limit(50).toArray();
   res.json(items.map(attachNormalizedSIC));
 });
-
-// COMPANY — normalize & merge from sbri_business_profiles (no projection)
 app.get('/api/sbri/company/:number', async (req, res) => {
   try {
     const n = String(req.params.number);
@@ -283,7 +431,6 @@ app.get('/api/sbri/company/:number', async (req, res) => {
     res.status(500).json({ error: 'profile_lookup_failed' });
   }
 });
-
 app.get('/api/sbri/company/:number/filings', async (req, res) => {
   const n = req.params.number;
   const page = Math.max(1, Number(req.query.page || 1));
@@ -296,8 +443,6 @@ app.get('/api/sbri/company/:number/filings', async (req, res) => {
     .toArray();
   res.json({ page, size, items });
 });
-
-// Director changes
 app.get('/api/sbri/company/:number/director-changes', async (req, res) => {
   try {
     const page = Math.max(1, Number(req.query.page || 1));
@@ -311,15 +456,10 @@ app.get('/api/sbri/company/:number/director-changes', async (req, res) => {
     res.status(500).json({ error: 'director_changes_failed' });
   }
 });
-
-// Sector (single)
 app.get('/api/sbri/sector/:sic', async (req, res) => {
   const doc = await db.collection('sector_stats').findOne({ sic_code: req.params.sic });
   res.json(doc || {});
 });
-
-// Sector (bulk) — NEW
-// GET /api/sbri/sector-bulk?codes=12345,62020&region=London
 app.get('/api/sbri/sector-bulk', async (req, res) => {
   try {
     const codes = String(req.query.codes || '').split(/[,\s]+/).filter(Boolean);
@@ -332,8 +472,6 @@ app.get('/api/sbri/sector-bulk', async (req, res) => {
     res.status(500).json({ error: 'sector_bulk_failed' });
   }
 });
-
-// SIC thresholds
 app.get('/api/sbri/sic-thresholds/:sic', async (req, res) => {
   try {
     const sic = String(req.params.sic);
@@ -352,23 +490,6 @@ app.get('/api/sbri/sic-thresholds/:sic', async (req, res) => {
     res.status(500).json({ error: 'sic_thresholds_failed' });
   }
 });
-
-// Quick classification utility (fixed typo)
-app.get('/api/sbri/classify', async (req, res) => {
-  try {
-    const sic = req.query.sic ? String(req.query.sic) : null;
-    const score = Number(req.query.score);
-    const region = req.query.region ? String(req.query.region) : null;
-    const thrDoc = await loadSicThresholds(sic, region);
-    const thresholds = thrDoc?.thresholds || DEFAULT_THRESHOLDS;
-    const band = classifyRiskWithThresholds(score, thresholds);
-    res.json({ sic_code: sic, region: thrDoc?.region ?? region ?? null, score, thresholds, band });
-  } catch {
-    res.status(500).json({ error: 'classify_failed' });
-  }
-});
-
-// FULL profile
 app.get('/api/sbri/company/:number/full', async (req, res) => {
   try {
     const n = String(req.params.number);
@@ -380,8 +501,6 @@ app.get('/api/sbri/company/:number/full', async (req, res) => {
     res.status(500).json({ error: 'profile_full_failed' });
   }
 });
-
-// SCORED — normalize + include ALL sector rows
 app.get('/api/sbri/company/:number/scored', async (req, res) => {
   try {
     const n = String(req.params.number);
@@ -391,8 +510,6 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
       const latest = await loadLatestAccounts(db, n);
       if (latest) profile.latest_accounts = latest;
     }
-
-    // merge/normalize SICs
     try {
       const bp = await db.collection('sbri_business_profiles').findOne({ company_number: n });
       const merged = { ...profile, ...(bp || {}) };
@@ -400,7 +517,6 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
     } catch {}
     attachNormalizedSIC(profile);
 
-    // stored score?
     let stored = null;
     try {
       const arr = await db.collection('sbri_risk_scores')
@@ -408,7 +524,6 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
       stored = arr[0] || null;
     } catch {}
 
-    // derive a score if not stored (using primary SIC sector for failure rate)
     let score, reasons;
     if (stored) {
       score = Number(stored.score);
@@ -417,7 +532,6 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
       const t = Number(profile.latest_accounts?.turnover) || 0;
       const p = Number(profile.latest_accounts?.profit) || 0;
       const margin = t > 0 ? p / t : 0;
-
       const primarySic = (profile.sic_codes || [])[0];
       let sector = null;
       try {
@@ -426,13 +540,11 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
       } catch {}
       const rawFail = sector?.failure_rate ?? 0;
       const failRate = rawFail > 1 ? rawFail / 100 : rawFail;
-
       const marginPenalty = margin >= 0.15 ? 0 : (margin <= 0 ? 1 : (0.15 - margin) / 0.15);
       const failurePenalty = Math.max(0, Math.min(1, failRate));
       const scoreFloat = 100 * (0.65 * marginPenalty + 0.35 * failurePenalty);
       score = Math.max(0, Math.min(100, Math.round(scoreFloat)));
       const level = score >= 70 ? 'high' : score >= 40 ? 'medium' : 'low';
-
       reasons = [
         `Gross margin ~ ${(margin * 100).toFixed(1)}%`,
         `Sector failure ~ ${(failurePenalty * 100).toFixed(1)}%`,
@@ -440,14 +552,12 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
       ];
     }
 
-    // threshold band uses first SIC (unchanged)
     const primarySic = (profile.sic_codes || [])[0] || null;
     const thrDoc = await loadSicThresholds(primarySic, profile.region);
     const thresholds = thrDoc?.thresholds || DEFAULT_THRESHOLDS;
     const industryBand = classifyRiskWithThresholds(score, thresholds);
     const legacyBand = classifyRiskWithThresholds(score, DEFAULT_THRESHOLDS);
 
-    // collect ALL sector rows for ALL SICs
     let sectors = [];
     if (Array.isArray(profile.sic_codes) && profile.sic_codes.length) {
       const q = profile.region
@@ -458,40 +568,25 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
 
     res.json({
       profile,
-      risk: {
-        score,
-        level: legacyBand,
-        industry_band: industryBand,
-        thresholds,
-        reasons
-      },
-      industry: {
-        sic_code: primarySic,
-        region: thrDoc?.region ?? profile.region ?? null,
-        thresholds_source: thrDoc ? 'db' : 'default'
-      },
+      risk: { score, level: legacyBand, industry_band: industryBand, thresholds, reasons },
+      industry: { sic_code: primarySic, region: thrDoc?.region ?? profile.region ?? null, thresholds_source: thrDoc ? 'db' : 'default' },
       sectors
     });
   } catch {
     res.status(500).json({ error: 'profile_scored_failed' });
   }
 });
-
-/* --- CCJ endpoint (baseline retained) --- */
 app.get('/api/sbri/company/:number/ccj', async (req, res) => {
   try {
     const n = String(req.params.number);
     const page = Math.max(1, Number(req.query.page || 1));
     const size = Math.min(100, Number(req.query.size || 25));
-
     const col = db.collection('sbri_ccj_details');
-
     const items = await col.find({ company_number: n })
       .sort({ judgment_date: -1 })
       .skip((page - 1) * size)
       .limit(size)
       .toArray();
-
     const summaryAgg = await col.aggregate([
       { $match: { company_number: n } },
       {
@@ -512,9 +607,7 @@ app.get('/api/sbri/company/:number/ccj', async (req, res) => {
       },
       { $project: { _id: 0 } }
     ]).toArray();
-
     const summary = summaryAgg[0] || { total: 0, total_amount: 0, unsatisfied: 0, latest_judgment_date: null };
-
     res.json({ page, size, summary, items });
   } catch {
     res.status(500).json({ error: 'ccj_fetch_failed' });
@@ -522,5 +615,5 @@ app.get('/api/sbri/company/:number/ccj', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log(`SBRI service running on port ${process.env.PORT || 3000} (v1.7.3)`);
+  console.log(`SBRI service running on port ${process.env.PORT || 3000} (v1.8.0 Live‑Data Pilot)`);
 });
