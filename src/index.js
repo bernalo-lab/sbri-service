@@ -1,4 +1,4 @@
-// index.js — SBRI service v1.7.1
+// index.js — SBRI service v1.7.2
 // Adds SIC normalization across payloads; retains SIC thresholds, director changes, CCJ & all baseline routes.
 
 import express from 'express';
@@ -283,7 +283,7 @@ app.get('/api/sbri/company/:number', async (req, res) => {
     }
     try {
       const bp = await db.collection('sbri_business_profiles')
-        .findOne({ company_number: n }, { projection: { sic_codes: 1, sic: 1, sic_code: 1 } });
+        .findOne({ company_number: n }); // ← no projection
       const merged = { ...withStatus, ...(bp || {}) };
       withStatus.sic_codes = normalizeSicArray(merged);
     } catch {}
@@ -390,7 +390,7 @@ app.get('/api/sbri/company/:number/scored', async (req, res) => {
     // merge/normalize SICs
     try {
       const bp = await db.collection('sbri_business_profiles')
-        .findOne({ company_number: n }, { projection: { sic_codes: 1, sic: 1, sic_code: 1 } });
+        .findOne({ company_number: n }); // ← no projection
       const merged = { ...profile, ...(bp || {}) };
       profile.sic_codes = normalizeSicArray(merged);
     } catch {}
