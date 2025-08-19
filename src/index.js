@@ -1,14 +1,16 @@
-// index.js — SBRI service v1.8.0 (Live‑Data Pilot)
+// index.js — SBRI service v1.8.1 (Live‑Data Pilot)
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import fetch from 'node-fetch';
 import { MongoClient } from 'mongodb';
 
 dotenv.config();
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Support for older Node
+const fetch = globalThis.fetch;
 
 const client = new MongoClient(process.env.MONGO_URI);
 await client.connect();
